@@ -69,6 +69,7 @@ pos = {
     'peak_pnl': 0.0, 'trail_sl': None,
     'entry_time': None,
     'ref_price': 0.0, 'ref_time': None,
+    'score': 0, 'session': '',
 }
 
 daily = {
@@ -77,6 +78,8 @@ daily = {
     'win_streak': 0, 'loss_streak': 0,
     'pause_until': None, 'pnl': 0.0,
 }
+
+trades_log = []  # in-memory trade history (resets on bot restart)
 
 
 # ════════════════════════════════════════════════════════════
@@ -451,6 +454,33 @@ def get_risk_pct(score, atr, price):
         return STREAK_RISK
     return BASE_RISK_PCT
 
+def log_trade(exit_price: float, exit_reason: str, won: bool, pnl_pct: float):
+    trade = {
+        'id': len(trades_log) + 1,
+        'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+        'time': datetime.now(timezone.utc).strftime('%H:%M'),
+        'side': pos['side'],
+        'entry': pos['entry'],
+        'exit': round(exit_price, 2),
+        'size': pos['size'],
+        'score': pos.get('score', 0),
+        'session': pos.get('session', ''),
+        'atr': round(pos['atr'], 2),
+        'sl': pos['sl'],
+        'tp1_hit': pos['tp1_hit'],
+        'tp2_hit': pos['tp2_hit'],
+        'peak_pnl': round(pos['peak_pnl'], 3),
+        'pnl_pct': round(pnl_pct, 3),
+        'won': won,
+        'exit_reason': exit_reason,
+        'duration_min': int((datetime.now(timezone.utc) - pos['entry_time']).total_seconds() / 60) if pos['entry_time'] else 0,
+    }
+    trades_log.append(trade)
+    if len(trades_log) > 1000:
+        trades_log.pop(0)
+    print(f'[TRADE #{trade["id"]}] {trade["side"].upper()} | {exit_reason} | PnL:{pnl_pct:+.3f}% | Score:{trade["score"]}')
+
+
 def record_result(won, pnl_pct):
     daily['trades'] += 1
     daily['pnl'] += pnl_pct
@@ -477,7 +507,7 @@ def reset_pos():
     pos.update(active=False, side=None, entry=0.0, size=0.0, remaining=0.0,
                sl=0.0, atr=0.0, r=0.0, tp1_hit=False, tp2_hit=False,
                peak_pnl=0.0, trail_sl=None, entry_time=None,
-               ref_price=0.0, ref_time=None)
+               ref_price=0.0, ref_time=None, score=0, session='')
 
 
 # ════════════════════════════════════════════════════════════
@@ -517,6 +547,7 @@ def monitor():
             if sl_hit:
                 close_all(side)
                 tg(f'🔴 <b>STOP LOSS</b>\n${price:,.2f} | SL was ${pos["sl"]:,.2f}\nPnL: {pnl_pct:+.2f}%')
+                log_trade(price, 'SL', False, pnl_pct)
                 record_result(False, pnl_pct)
                 reset_pos()
                 continue
@@ -527,6 +558,7 @@ def monitor():
                 if giveback >= MAX_GIVEBACK:
                     close_all(side)
                     tg(f'💰 <b>MAX GIVEBACK</b>\nPeak: {pos["peak_pnl"]:.2f}% → Now: {pnl_pct:.2f}%\nClosed at ${price:,.2f}')
+                    log_trade(price, 'Max Giveback', pnl_pct > 0, pnl_pct)
                     record_result(pnl_pct > 0, pnl_pct)
                     reset_pos()
                     continue
@@ -540,6 +572,7 @@ def monitor():
                 if move < TIME_STOP_MOVE:
                     close_all(side)
                     tg(f'⏱ <b>TIME STOP</b>\n{TIME_STOP_MIN}min, move {move*100:.2f}%\nClosed at ${price:,.2f}')
+                    log_trade(price, 'Time Stop', pnl_pct > 0, pnl_pct)
                     record_result(pnl_pct > 0, pnl_pct)
                     reset_pos()
                     continue
@@ -578,6 +611,7 @@ def monitor():
                     if price <= pos['trail_sl']:
                         close_all('long')
                         tg(f'📉 <b>TRAILING STOP</b>\nClosed at ${price:,.2f} | Trail was ${pos["trail_sl"]:,.2f}\nPnL: {pnl_pct:+.2f}%')
+                        log_trade(price, 'Trailing Stop', pnl_pct > 0, pnl_pct)
                         record_result(pnl_pct > 0, pnl_pct)
                         reset_pos()
                         continue
@@ -588,6 +622,7 @@ def monitor():
                     if price >= pos['trail_sl']:
                         close_all('short')
                         tg(f'📉 <b>TRAILING STOP</b>\nClosed at ${price:,.2f}\nPnL: {pnl_pct:+.2f}%')
+                        log_trade(price, 'Trailing Stop', pnl_pct > 0, pnl_pct)
                         record_result(pnl_pct > 0, pnl_pct)
                         reset_pos()
 
@@ -634,8 +669,14 @@ async def webhook(request: Request):
         if pos['active']:
             side = 'long' if action == 'close_long' else 'short'
             close_all(side)
-            price = get_price() or 0
-            tg(f'⚪ <b>Manual Close {side.upper()}</b> at ${price:,.2f}')
+            price = get_price() or pos['entry']
+            pnl_pct = 0.0
+            if price and pos['entry']:
+                pnl_pct = ((price - pos['entry']) / pos['entry'] * 100) if side == 'long' \
+                          else ((pos['entry'] - price) / pos['entry'] * 100)
+            tg(f'⚪ <b>Manual Close {side.upper()}</b> at ${price:,.2f}\nPnL: {pnl_pct:+.2f}%')
+            log_trade(price, 'Manual Close', pnl_pct > 0, pnl_pct)
+            record_result(pnl_pct > 0, pnl_pct)
             reset_pos()
         return JSONResponse({'status': 'closed'})
 
@@ -727,6 +768,7 @@ async def webhook(request: Request):
         sl=sl_price, atr=atr, r=sl_dist,
         tp1_hit=False, tp2_hit=False, peak_pnl=0.0, trail_sl=None,
         entry_time=now, ref_price=price, ref_time=now,
+        score=score, session=session_name,
     )
 
     emoji = '🟢' if side == 'long' else '🔴'
@@ -758,6 +800,65 @@ async def webhook(request: Request):
         'atr': round(atr, 2), 'risk_usd': round(risk_usd, 2),
         'session': session_name,
     })
+
+
+# ════════════════════════════════════════════════════════════
+# TRADES & REPORT
+# ════════════════════════════════════════════════════════════
+@app.get('/trades')
+async def get_trades():
+    return {'count': len(trades_log), 'trades': trades_log}
+
+
+@app.get('/report')
+async def get_report():
+    if not trades_log:
+        return {'total_trades': 0, 'message': 'No trades yet (resets on restart). Use /status for today stats.'}
+
+    total = len(trades_log)
+    wins  = sum(1 for t in trades_log if t['won'])
+    total_pnl = sum(t['pnl_pct'] for t in trades_log)
+
+    by_score = {}
+    for t in trades_log:
+        s = t['score']
+        b = '95+' if s >= 95 else ('90-94' if s >= 90 else ('85-89' if s >= 85 else ('80-84' if s >= 80 else '75-79')))
+        if b not in by_score:
+            by_score[b] = {'trades': 0, 'wins': 0}
+        by_score[b]['trades'] += 1
+        if t['won']:
+            by_score[b]['wins'] += 1
+
+    by_session = {}
+    for t in trades_log:
+        k = t.get('session') or 'Unknown'
+        if k not in by_session:
+            by_session[k] = {'trades': 0, 'wins': 0, 'pnl': 0.0}
+        by_session[k]['trades'] += 1
+        if t['won']:
+            by_session[k]['wins'] += 1
+        by_session[k]['pnl'] = round(by_session[k]['pnl'] + t['pnl_pct'], 3)
+
+    by_reason = {}
+    for t in trades_log:
+        r = t['exit_reason']
+        if r not in by_reason:
+            by_reason[r] = {'trades': 0, 'wins': 0}
+        by_reason[r]['trades'] += 1
+        if t['won']:
+            by_reason[r]['wins'] += 1
+
+    return {
+        'total_trades': total,
+        'wins': wins, 'losses': total - wins,
+        'win_rate': round(wins / total * 100, 1),
+        'total_pnl_pct': round(total_pnl, 3),
+        'avg_pnl_pct': round(total_pnl / total, 3),
+        'by_score': by_score,
+        'by_session': by_session,
+        'by_exit_reason': by_reason,
+        'recent_5': trades_log[-5:],
+    }
 
 
 # ════════════════════════════════════════════════════════════
