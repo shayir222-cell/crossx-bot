@@ -26,6 +26,15 @@ BASE_URL = 'https://api.bitget.com'
 
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
 
+# ─── Min ATR % per symbol (filters "sleeping" markets) ───
+MIN_ATR_PCT = {
+    'BTCUSDT': 0.00035,  # 0.035% → ~$27 min ATR at $78k
+    'ETHUSDT': 0.00045,  # 0.045% → ~$1.7 min ATR at $3800
+    'BNBUSDT': 0.00080,  # 0.080% → ~$0.5 min ATR at $615
+    'SOLUSDT': 0.00090,  # 0.090% → ~$0.14 min ATR at $155
+    'XRPUSDT': 0.00100,  # 0.100% → ~$0.002 min ATR at $2.3
+}
+
 # ─── Risk ────────────────────────────────────────────────
 BASE_RISK_PCT    = 0.01
 HIGH_VOL_RISK    = 0.005
@@ -781,11 +790,12 @@ async def webhook(request: Request):
     session_name, risk_mult = get_session()
     high_vol = is_high_volatility(atr, price)
 
-    # ATR volatility filter — skip if market too quiet (ATR < 0.15% of price)
-    atr_pct = atr / price
-    if atr_pct < 0.0015:
-        print(f'[FILTER] {symbol} ATR too small: {atr_pct*100:.3f}% < 0.15% (choppy market)')
-        return JSONResponse({'status': 'filtered', 'reason': f'{symbol} ATR {atr_pct*100:.3f}% < 0.15% — market too quiet'})
+    # ATR volatility filter — skip if market too quiet (per-symbol threshold)
+    atr_pct     = atr / price
+    min_atr_pct = MIN_ATR_PCT.get(symbol, 0.0005)
+    if atr_pct < min_atr_pct:
+        print(f'[FILTER] {symbol} ATR {atr_pct*100:.3f}% < {min_atr_pct*100:.3f}% (market too quiet)')
+        return JSONResponse({'status': 'filtered', 'reason': f'{symbol} ATR {atr_pct*100:.3f}% < {min_atr_pct*100:.3f}% — market too quiet'})
 
     # Risk + sizing
     risk_pct = get_risk_pct(symbol, score, atr, price) * risk_mult
