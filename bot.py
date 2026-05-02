@@ -140,9 +140,9 @@ def api_post(path, body):
         return {}
 
 def get_balance():
-    d = api_get('/api/v2/mix/account/account?productType=USDT-FUTURES&marginCoin=USDT')
-    if d.get('code') == '00000':
-        return float(d['data']['available'])
+    d = api_get('/api/v2/mix/account/accounts?productType=USDT-FUTURES')
+    if d.get('code') == '00000' and d.get('data'):
+        return float(d['data'][0]['available'])
     return None
 
 def get_price():
