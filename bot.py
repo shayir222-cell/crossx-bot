@@ -28,28 +28,28 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
 
 # ─── Min ATR % per symbol (filters "sleeping" markets) ───
 MIN_ATR_PCT = {
-    'BTCUSDT': 0.00035,  # 0.035% → ~$27 min ATR at $78k
-    'ETHUSDT': 0.00045,  # 0.045% → ~$1.7 min ATR at $3800
-    'BNBUSDT': 0.00080,  # 0.080% → ~$0.5 min ATR at $615
-    'SOLUSDT': 0.00090,  # 0.090% → ~$0.14 min ATR at $155
-    'XRPUSDT': 0.00100,  # 0.100% → ~$0.002 min ATR at $2.3
+    'BTCUSDT': 0.00080,  # 0.08% → ~$62 min ATR at $78k (fee-efficient at 7x)
+    'ETHUSDT': 0.00090,  # 0.09% → ~$3.4 min ATR at $3800
+    'BNBUSDT': 0.00120,  # 0.12% → ~$0.74 min ATR at $615
+    'SOLUSDT': 0.00130,  # 0.13% → ~$0.20 min ATR at $155
+    'XRPUSDT': 0.00150,  # 0.15% → ~$0.003 min ATR at $2.3
 }
 
 # ─── Risk ────────────────────────────────────────────────
 BASE_RISK_PCT    = 0.01
 HIGH_VOL_RISK    = 0.005
 STREAK_RISK      = 0.0125
-LEVERAGE         = 10
+LEVERAGE         = 7     # 10→7: reduces notional 30% → fees 30% lower
 DAILY_LOSS_LIMIT = 0.10
 
 # ─── ATR levels ──────────────────────────────────────────
 SL_ATR_MULT    = 1.5
-TP1_R          = 1.5
-TP2_R          = 3.0
-TRAIL_ATR_MULT = 1.0
-MAX_GIVEBACK   = 0.35
-TP1_SIZE_PCT   = 0.30
-TP2_SIZE_PCT   = 0.30
+TP1_R          = 2.5   # 1.5→2.5: first TP profit must outpace open+close fees
+TP2_R          = 5.0   # 3.0→5.0: let full winners run
+TRAIL_ATR_MULT = 1.5   # 1.0→1.5: tighter trail protects more peak profit
+MAX_GIVEBACK   = 0.30  # 0.35→0.30: give back less at peak
+TP1_SIZE_PCT   = 0.40  # 0.30→0.40: lock in more at first TP
+TP2_SIZE_PCT   = 0.30  # unchanged
 
 # ─── Score ───────────────────────────────────────────────
 MIN_SCORE = 75
@@ -849,8 +849,8 @@ async def webhook(request: Request):
         f'Size:  {size} (${size*price:,.0f})\n'
         f'ATR:   ${atr:,.4f} {"⚠️ HIGH VOL" if high_vol else ""}\n'
         f'SL:    ${sl_price:,.4f}\n'
-        f'TP1:   ${tp1_price:,.4f} (+{TP1_R}R → 30%)\n'
-        f'TP2:   ${tp2_price:,.4f} (+{TP2_R}R → 30%)\n'
+        f'TP1:   ${tp1_price:,.4f} (+{TP1_R}R → {int(TP1_SIZE_PCT*100)}%)\n'
+        f'TP2:   ${tp2_price:,.4f} (+{TP2_R}R → {int(TP2_SIZE_PCT*100)}%)\n'
         f'Risk:  ${risk_usd:.2f} ({risk_pct*100:.1f}%)\n'
         f'Session: {session_name} | MTF: {mtf_info}'
     )
