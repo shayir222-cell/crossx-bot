@@ -631,6 +631,50 @@ def monitor():
 
 
 # ════════════════════════════════════════════════════════════
+# WEEKLY TELEGRAM REPORT
+# ════════════════════════════════════════════════════════════
+_last_weekly_report = {'week': ''}
+
+def send_weekly_report():
+    week_key = datetime.now(timezone.utc).strftime('%Y-W%U')
+    if _last_weekly_report['week'] == week_key:
+        return
+    _last_weekly_report['week'] = week_key
+
+    if not trades_log:
+        tg('📊 <b>Недельный отчёт</b>\nСделок на этой неделе не было.')
+        return
+
+    total = len(trades_log)
+    wins  = sum(1 for t in trades_log if t['won'])
+    wr    = wins / total * 100
+    pnl   = sum(t['pnl_pct'] for t in trades_log)
+
+    by_reason = {}
+    for t in trades_log:
+        r = t['exit_reason']
+        by_reason[r] = by_reason.get(r, 0) + 1
+
+    reasons_str = ' | '.join(f'{r}: {c}' for r, c in sorted(by_reason.items(), key=lambda x: -x[1]))
+    balance = get_balance()
+    bal_str = f'${balance:.2f}' if balance else '—'
+
+    tg(
+        f'📊 <b>Недельный отчёт CrossX Pro</b>\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'Баланс: <b>{bal_str}</b>\n'
+        f'Сделок: <b>{total}</b> (побед: {wins}, потерь: {total-wins})\n'
+        f'Win Rate: <b>{wr:.1f}%</b>\n'
+        f'PnL итого: <b>{pnl:+.3f}%</b>\n'
+        f'Avg PnL: {pnl/total:+.3f}%\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'Выходы: {reasons_str}\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'Obsidian обновится в 04:00'
+    )
+
+
+# ════════════════════════════════════════════════════════════
 # KEEP-ALIVE (prevents Render free tier spindown)
 # ════════════════════════════════════════════════════════════
 def keep_alive():
@@ -641,6 +685,13 @@ def keep_alive():
                 requests.get(f'{RENDER_URL}/ping', timeout=5)
             except Exception:
                 pass
+        # Weekly report — every Sunday at 20:00 UTC
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 6 and now.hour == 20:
+            try:
+                send_weekly_report()
+            except Exception as e:
+                print(f'[WEEKLY] {e}')
 
 @app.get('/ping')
 async def ping():
