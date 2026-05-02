@@ -148,9 +148,19 @@ def api_post(path, body):
         return {}
 
 def get_balance():
+    """Returns available balance for position sizing."""
     d = api_get('/api/v2/mix/account/accounts?productType=USDT-FUTURES')
     if d.get('code') == '00000' and d.get('data'):
         return float(d['data'][0]['available'])
+    return None
+
+def get_equity():
+    """Returns total account equity (available + locked margin + unrealized PnL) for daily loss check."""
+    d = api_get('/api/v2/mix/account/accounts?productType=USDT-FUTURES')
+    if d.get('code') == '00000' and d.get('data'):
+        acc = d['data'][0]
+        # usdtEquity = total equity; fallback to available if not present
+        return float(acc.get('usdtEquity') or acc.get('equity') or acc.get('available') or 0)
     return None
 
 def get_price(symbol):
@@ -394,13 +404,14 @@ def reset_daily():
         print(f'[DAY] New day: {today}')
 
 def check_daily_loss(balance):
+    equity = get_equity() or balance  # use total equity, not just available
     if daily['start_balance'] is None:
-        daily['start_balance'] = balance
+        daily['start_balance'] = equity
         return False
-    lost = (daily['start_balance'] - balance) / daily['start_balance']
+    lost = (daily['start_balance'] - equity) / daily['start_balance']
     if lost >= DAILY_LOSS_LIMIT:
         daily['halted'] = True
-        tg(f'🛑 <b>DAILY STOP</b>\nLoss: <b>-{lost*100:.1f}%</b>\nBalance: ${balance:.2f}\nStopped until tomorrow.')
+        tg(f'🛑 <b>DAILY STOP</b>\nLoss: <b>-{lost*100:.1f}%</b>\nEquity: ${equity:.2f}\nStopped until tomorrow.')
         return True
     return False
 
@@ -907,9 +918,10 @@ async def get_report():
 async def status():
     reset_daily()
     balance  = get_balance()
+    equity   = get_equity() or balance
     loss_pct = 0.0
-    if daily['start_balance'] and balance:
-        loss_pct = (daily['start_balance'] - balance) / daily['start_balance'] * 100
+    if daily['start_balance'] and equity:
+        loss_pct = (daily['start_balance'] - equity) / daily['start_balance'] * 100
 
     session_name, _ = get_session()
 
@@ -947,6 +959,7 @@ async def status():
         'bot': 'CrossX Pro Bot v3.0',
         'symbols': SYMBOLS,
         'balance': f'${balance:.2f}' if balance else 'error',
+        'equity': f'${equity:.2f}' if equity else 'error',
         'daily_loss': f'{loss_pct:.2f}%',
         'daily_pnl': f'${daily["pnl"]:.2f}',
         'halted': daily['halted'],
