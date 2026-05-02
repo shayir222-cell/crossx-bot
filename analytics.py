@@ -3,8 +3,8 @@ CrossX Analytics — автоматически обновляет Obsidian vaul
 Запуск:  python analytics.py
 Авто:    Task Scheduler каждый день в 01:00
 """
-import os, json, hmac, hashlib, base64, time, requests
-from datetime import datetime, timezone, timedelta
+import os, hmac, hashlib, base64, requests
+from datetime import datetime, timezone
 
 BOT_URL  = "https://crossx-bot.onrender.com"
 VAULT    = r"C:\Users\Дастан\Documents\CrossX-Trading-Vault"
@@ -475,20 +475,20 @@ def update_dashboard(status, a, today):
 - [[Observations/Bot-Performance-Log|Лог работы бота]]
 - [[Trades/README|Журнал сделок]]
 
-## Настройки бота
+## Настройки бота (v3.1)
 
 | Параметр | Значение |
 |---|---|
-| Symbol | BTCUSDT Perpetual |
+| Символы | BTCUSDT / ETHUSDT / BNBUSDT / SOLUSDT / XRPUSDT |
 | Timeframe | 5m entry / 15m-1h-4h confirm |
-| Min Score | 75/100 |
-| Leverage | 10x isolated |
-| Base Risk | 1% |
-| SL | ATR × 1.5 |
-| TP1 | +1.5R → 30% |
-| TP2 | +3.0R → 30% |
-| Trailing | ATR × 1.0 |
-| Daily Stop | -10% |
+| Min Score | {status.get('settings', {}).get('min_score', 82)}/100 |
+| Leverage | {status.get('settings', {}).get('leverage', '7x')} isolated |
+| SL | {status.get('settings', {}).get('sl', 'ATR×1.5')} |
+| TP1 | {status.get('settings', {}).get('tp1', '+2.5R (40%)')} |
+| TP2 | {status.get('settings', {}).get('tp2', '+5.0R (30%)')} |
+| Trailing | {status.get('settings', {}).get('trail', 'ATR×1.5')} |
+| Daily Stop | {status.get('settings', {}).get('daily_stop', '-10%')} |
+| Сессии | London 07-16 UTC + NY 13-21 UTC |
 """
     write_file("Dashboard.md", content)
 
@@ -512,6 +512,93 @@ def append_perf_log(status, a, today):
 
 
 # ──────────────────────────────────────────────────────────────
+# Session Context — для быстрого восстановления диалога Claude
+# ──────────────────────────────────────────────────────────────
+def write_session_context(status, signals, a, today):
+    now      = datetime.now(timezone.utc)
+    balance  = status.get("balance", "—")
+    equity   = status.get("equity", "—")
+    halted   = status.get("halted", False)
+    session  = status.get("session", "—")
+    sett     = status.get("settings", {})
+    d_trades = status.get("daily_trades", 0)
+    d_wins   = status.get("daily_wins", 0)
+    d_losses = status.get("daily_losses", 0)
+    d_loss   = status.get("daily_loss", "0.00%")
+
+    total_sig  = signals.get("total_signals", 0)
+    taken      = signals.get("taken", 0)
+    filtered   = signals.get("filtered", 0)
+    frate      = signals.get("filter_rate", "—")
+    sc_taken   = signals.get("avg_score_taken", 0)
+    sc_filt    = signals.get("avg_score_filtered", 0)
+
+    reasons = signals.get("filter_reasons", {})
+    reasons_md = ""
+    for r, c in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
+        reasons_md += f"- **{c}x** {r}\n"
+    if not reasons_md:
+        reasons_md = "- Нет данных\n"
+
+    stats_line = f"Win Rate: {a['win_rate']}% | {a['total']} сделок | PnL: {a['total_pnl']:+.3f}%" if a else "Нет данных о сделках"
+
+    last_10 = signals.get("last_10", [])
+    sig_rows = ""
+    for s in last_10:
+        sig_rows += f"| {s.get('date','')} {s.get('time','')} | {s.get('symbol','')} | {s.get('action','').upper()} | {s.get('score',0)} | {s.get('status','')} | {str(s.get('reason',''))[:45]} |\n"
+
+    content = f"""# CrossX Bot — Контекст сессии
+> Автообновление: {now.strftime('%Y-%m-%d %H:%M')} UTC (Task Scheduler ежедневно 04:00)
+
+## Статус прямо сейчас
+| | |
+|---|---|
+| Баланс | **{balance}** |
+| Equity | **{equity}** |
+| Halt | {'🛑 ДА' if halted else '❌ Нет'} |
+| Сессия | {session} |
+| Сделок сегодня | {d_trades} (побед {d_wins} / потерь {d_losses}) |
+| Потери дня | {d_loss} |
+
+## Активные параметры бота
+```
+Leverage:   {sett.get('leverage','7x')}
+Min Score:  {sett.get('min_score',82)}
+SL:         {sett.get('sl','ATR×1.5')}
+TP1:        {sett.get('tp1','+2.5R (40%)')}
+TP2:        {sett.get('tp2','+5.0R (30%)')}
+Trailing:   {sett.get('trail','ATR×1.5')}
+Daily Stop: {sett.get('daily_stop','-10%')}
+Сессии:     London 07-16 UTC + NY 13-21 UTC ONLY
+```
+
+## Аналитика сигналов (текущая сессия бота)
+- Всего сигналов: **{total_sig}** | Принято: **{taken}** | Отфильтровано: **{filtered}** ({frate})
+- Avg score принятых: **{sc_taken}** | Отфильтрованных: **{sc_filt}**
+
+### Топ причины фильтрации
+{reasons_md}
+## Статистика сделок
+{stats_line}
+
+## Последние 10 сигналов
+| Время | Символ | Действие | Score | Статус | Причина |
+|---|---|---|---|---|---|
+{sig_rows if sig_rows else "| — | — | — | — | — | Нет данных |\n"}
+## Как возобновить работу в новой сессии Claude
+Скажи: **"Проверь статус бота и продолжим"** — Claude прочитает memory + этот файл и продолжит с полным контекстом.
+
+## Ключевые ссылки
+- [/status](https://crossx-bot.onrender.com/status)
+- [/signals](https://crossx-bot.onrender.com/signals)
+- [/trades](https://crossx-bot.onrender.com/trades)
+- [/reset-daily](https://crossx-bot.onrender.com/reset-daily)
+"""
+    write_file("Session-Context.md", content)
+    print("  [OK] Session-Context.md")
+
+
+# ──────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────
 def run():
@@ -524,9 +611,10 @@ def run():
     # 1. Fetch data
     print("\n[1] Получаю данные...")
     status     = bot_get("status")
+    signals    = bot_get("signals")
     trades_raw = bot_get("trades")
     bot_trades = trades_raw.get("trades", []) if trades_raw else []
-    print(f"    Бот: баланс={status.get('balance','?')}, сделок бота={len(bot_trades)}")
+    print(f"    Бот: баланс={status.get('balance','?')}, сделок={len(bot_trades)}, сигналов={signals.get('total_signals',0)}")
 
     print("    Bitget история...")
     bg_trades = fetch_bitget_history()
@@ -564,6 +652,7 @@ def run():
     write_suggestions(sugg, a, today)
     update_dashboard(status, a, today)
     append_perf_log(status, a, today)
+    write_session_context(status, signals, a, today)
 
     print(f"\n[4] Предложения по улучшению бота:")
     for s in sugg:

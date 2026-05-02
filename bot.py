@@ -1056,7 +1056,7 @@ async def status():
         'symbols': SYMBOLS,
         'balance': f'${balance:.2f}' if balance else 'error',
         'equity': f'${equity:.2f}' if equity else 'error',
-        'daily_loss': f'{loss_pct:.2f}%',
+        'daily_loss': f'{max(loss_pct, 0):.2f}%',
         'daily_pnl': f'${daily["pnl"]:.2f}',
         'halted': daily['halted'],
         'session': session_name,
