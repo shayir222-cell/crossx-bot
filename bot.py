@@ -166,21 +166,18 @@ def get_candles(symbol, gran='5m', limit=60):
     return None
 
 def set_leverage(symbol):
-    for side in ('long', 'short'):
-        api_post('/api/v2/mix/account/set-leverage', {
-            'symbol': symbol, 'productType': 'USDT-FUTURES',
-            'marginCoin': 'USDT', 'leverage': str(LEVERAGE), 'holdSide': side,
-        })
+    api_post('/api/v2/mix/account/set-leverage', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES',
+        'marginCoin': 'USDT', 'leverage': str(LEVERAGE),
+    })
 
 def place_order(symbol, side, size, reduce_only=False):
-    body = {
+    return api_post('/api/v2/mix/order/place-order', {
         'symbol': symbol, 'productType': 'USDT-FUTURES',
         'marginMode': 'isolated', 'marginCoin': 'USDT',
         'size': str(round(size, 4)), 'side': side, 'orderType': 'market',
-    }
-    if reduce_only:
-        body['reduceOnly'] = 'YES'
-    return api_post('/api/v2/mix/order/place-order', body)
+        'tradeSide': 'close' if reduce_only else 'open',
+    })
 
 def close_all(symbol, hold_side):
     return api_post('/api/v2/mix/order/close-positions', {
