@@ -781,6 +781,12 @@ async def webhook(request: Request):
     session_name, risk_mult = get_session()
     high_vol = is_high_volatility(atr, price)
 
+    # ATR volatility filter — skip if market too quiet (ATR < 0.15% of price)
+    atr_pct = atr / price
+    if atr_pct < 0.0015:
+        print(f'[FILTER] {symbol} ATR too small: {atr_pct*100:.3f}% < 0.15% (choppy market)')
+        return JSONResponse({'status': 'filtered', 'reason': f'{symbol} ATR {atr_pct*100:.3f}% < 0.15% — market too quiet'})
+
     # Risk + sizing
     risk_pct = get_risk_pct(symbol, score, atr, price) * risk_mult
     risk_usd  = balance * risk_pct
@@ -788,11 +794,11 @@ async def webhook(request: Request):
     size      = round(risk_usd / sl_dist, 4)
     if size < 0.001:
         size = 0.001
-    # Cap: never use more than 90% of max leverage capacity
-    max_size = round((balance * LEVERAGE * 0.90) / price, 4)
+    # Cap: never use more than 20% of balance as margin (allows up to 5 concurrent positions)
+    max_size = round((balance * 0.20 * LEVERAGE) / price, 4)
     if size > max_size:
         size = max_size
-        print(f'[SIZE CAP] {symbol} size capped to {size} (balance limit)')
+        print(f'[SIZE CAP] {symbol} capped to {size} (20% margin limit)')
 
     # Levels
     if side == 'long':
