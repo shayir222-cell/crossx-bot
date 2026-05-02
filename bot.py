@@ -978,6 +978,13 @@ async def status():
         }
     }
 
+@app.get('/reset-daily')
+async def reset_daily_endpoint():
+    """Reset daily halt/stats — call after midnight or after false halt."""
+    daily.update(date=str(date.today()), start_balance=None, halted=False,
+                 trades=0, wins=0, losses=0, pnl=0.0)
+    return {'status': 'daily stats reset', 'date': daily['date']}
+
 @app.get('/')
 async def home():
     return {'status': 'running', 'bot': 'CrossX Pro Bot v3.0', 'symbols': SYMBOLS}
