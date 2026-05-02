@@ -3,7 +3,7 @@ CrossX Pro Bot v3.0 — Multi-Symbol Elite Trading System
 BTCUSDT | ETHUSDT | BNBUSDT | SOLUSDT | XRPUSDT
 Bitget Futures | 5m Timeframe
 """
-import os, json, time, hmac, hashlib, base64, math, threading
+import os, json, time, hmac, hashlib, base64, threading
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -52,7 +52,7 @@ TP1_SIZE_PCT   = 0.40  # 0.30→0.40: lock in more at first TP
 TP2_SIZE_PCT   = 0.30  # unchanged
 
 # ─── Score ───────────────────────────────────────────────
-MIN_SCORE = 75
+MIN_SCORE = 82  # 75→82: only high-confidence setups
 
 # ─── Sessions (UTC hours) ────────────────────────────────
 LONDON_OPEN  = 7
@@ -61,8 +61,15 @@ NY_OPEN      = 13
 NY_CLOSE     = 21
 
 # ─── Streak pauses ───────────────────────────────────────
-PAUSE_2L = 30
-PAUSE_3L = 60
+PAUSE_2L   = 30
+PAUSE_3L   = 60
+SL_COOLDOWN = 15  # minutes cooldown after any SL hit
+
+# ─── Correlation groups (don't open same-direction in same group) ─
+CORR_GROUPS = [
+    {'BTCUSDT', 'ETHUSDT'},        # ~0.85 correlation
+    {'SOLUSDT', 'BNBUSDT'},        # altcoin group
+]
 
 # ─── Time stop ───────────────────────────────────────────
 TIME_STOP_MIN  = 30
@@ -84,7 +91,7 @@ def _make_pos():
     }
 
 def _make_sym():
-    return {'win_streak': 0, 'loss_streak': 0, 'pause_until': None}
+    return {'win_streak': 0, 'loss_streak': 0, 'pause_until': None, 'sl_cooldown_until': None}
 
 positions  = {s: _make_pos() for s in SYMBOLS}
 sym_state  = {s: _make_sym() for s in SYMBOLS}
@@ -372,8 +379,12 @@ def get_session():
     if in_ld and in_ny: return 'London/NY Overlap', 1.0
     elif in_ld:         return 'London', 1.0
     elif in_ny:         return 'New York', 1.0
-    elif 0 <= h < 7:    return 'Asian (low)', 0.6
-    else:               return 'Off-session', 0.75
+    elif 0 <= h < 7:    return 'Asian', 0.0   # blocked: low liquidity + fee drain
+    else:               return 'Off-session', 0.0  # blocked: pre-London dead zone
+
+def is_session_blocked():
+    _, mult = get_session()
+    return mult == 0.0
 
 
 # ════════════════════════════════════════════════════════════
@@ -425,22 +436,47 @@ def check_daily_loss(balance):
     return False
 
 def is_paused(symbol):
-    pu = sym_state[symbol]['pause_until']
-    if not pu:
-        return False, ''
     now = datetime.now(timezone.utc)
-    if now < pu:
+    st = sym_state[symbol]
+    # Loss streak pause
+    pu = st['pause_until']
+    if pu and now < pu:
         mins = int((pu - now).total_seconds() / 60)
         return True, f'Pause {mins}m remaining (loss streak)'
-    sym_state[symbol]['pause_until'] = None
+    if pu:
+        st['pause_until'] = None
+    # SL cooldown
+    cd = st['sl_cooldown_until']
+    if cd and now < cd:
+        mins = int((cd - now).total_seconds() / 60)
+        return True, f'SL cooldown {mins}m remaining'
+    if cd:
+        st['sl_cooldown_until'] = None
     return False, ''
 
-def get_risk_pct(symbol, score, atr, price):
+def is_correlated_blocked(symbol, side):
+    """Returns True if a correlated symbol already has an active position in the same direction."""
+    for group in CORR_GROUPS:
+        if symbol not in group:
+            continue
+        for other in group:
+            if other == symbol:
+                continue
+            op = positions[other]
+            if op['active'] and op['side'] == side:
+                return True, f'Correlated pair {other} already {side}'
+    return False, ''
+
+def get_risk_pct(score, atr, price):
     if is_high_volatility(atr, price):
         return HIGH_VOL_RISK
-    if sym_state[symbol]['win_streak'] >= 3 and score > 90:
-        return STREAK_RISK
-    return BASE_RISK_PCT
+    # Scale risk by score quality
+    if score >= 90:
+        return STREAK_RISK      # 1.25%
+    elif score >= 82:
+        return BASE_RISK_PCT    # 1.0%
+    else:
+        return BASE_RISK_PCT * 0.5  # 0.5% for borderline signals
 
 def record_result(symbol, won, pnl_pct):
     daily['trades'] += 1
@@ -454,6 +490,8 @@ def record_result(symbol, won, pnl_pct):
         daily['losses'] += 1
         st['loss_streak'] += 1
         st['win_streak'] = 0
+        # SL cooldown after every loss
+        st['sl_cooldown_until'] = datetime.now(timezone.utc) + timedelta(minutes=SL_COOLDOWN)
         if st['loss_streak'] == 2:
             st['pause_until'] = datetime.now(timezone.utc) + timedelta(minutes=PAUSE_2L)
             tg(f'⏸ <b>{symbol}: 2 losses</b> — pausing {PAUSE_2L}min')
@@ -742,6 +780,10 @@ async def webhook(request: Request):
     if daily['halted']:
         return JSONResponse({'status': 'halted', 'reason': 'Daily loss limit'})
 
+    if is_session_blocked():
+        session_name, _ = get_session()
+        return JSONResponse({'status': 'filtered', 'reason': f'{session_name} — trading blocked (low liquidity)'})
+
     paused, pause_reason = is_paused(symbol)
     if paused:
         return JSONResponse({'status': 'paused', 'reason': pause_reason})
@@ -750,6 +792,9 @@ async def webhook(request: Request):
         return JSONResponse({'status': 'skipped', 'reason': f'{symbol} position already open'})
 
     side = 'long' if action == 'buy' else 'short'
+    corr_blocked, corr_reason = is_correlated_blocked(symbol, side)
+    if corr_blocked:
+        return JSONResponse({'status': 'filtered', 'reason': corr_reason})
 
     # Balance
     balance = get_balance()
@@ -798,7 +843,7 @@ async def webhook(request: Request):
         return JSONResponse({'status': 'filtered', 'reason': f'{symbol} ATR {atr_pct*100:.3f}% < {min_atr_pct*100:.3f}% — market too quiet'})
 
     # Risk + sizing
-    risk_pct = get_risk_pct(symbol, score, atr, price) * risk_mult
+    risk_pct = get_risk_pct(score, atr, price) * risk_mult
     risk_usd  = balance * risk_pct
     sl_dist   = atr * SL_ATR_MULT
     size      = round(risk_usd / sl_dist, 4)
