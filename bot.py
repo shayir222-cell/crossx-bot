@@ -98,12 +98,26 @@ def tg(text: str):
 # ════════════════════════════════════════════════════════════
 # BITGET API
 # ════════════════════════════════════════════════════════════
+_time_offset = 0  # ms offset between local and Bitget server time
+
+def _sync_time():
+    global _time_offset
+    try:
+        r = requests.get('https://api.bitget.com/api/v2/public/time', timeout=5)
+        server_ts = int(r.json()['data']['serverTime'])
+        _time_offset = server_ts - int(time.time() * 1000)
+    except Exception:
+        _time_offset = 0
+
+def _ts():
+    return str(int(time.time() * 1000) + _time_offset)
+
 def _sign(ts, method, path, body=''):
     msg = ts + method.upper() + path + body
     return base64.b64encode(hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()).decode()
 
 def _h(method, path, body=''):
-    ts = str(int(time.time() * 1000))
+    ts = _ts()
     return {
         'ACCESS-KEY': API_KEY, 'ACCESS-SIGN': _sign(ts, method, path, body),
         'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': PASSPHRASE,
@@ -803,6 +817,7 @@ async def home():
 # ════════════════════════════════════════════════════════════
 @app.on_event('startup')
 async def startup():
+    _sync_time()
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
     print('[BOT] CrossX Pro Bot v2.0 started — BTCUSDT 5m')
