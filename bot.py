@@ -777,6 +777,11 @@ async def webhook(request: Request):
     size      = round(risk_usd / sl_dist, 4)
     if size < 0.001:
         size = 0.001
+    # Cap: never use more than 90% of max leverage capacity
+    max_size = round((balance * LEVERAGE * 0.90) / price, 4)
+    if size > max_size:
+        size = max_size
+        print(f'[SIZE CAP] {symbol} size capped to {size} (balance limit)')
 
     # Levels
     if side == 'long':
