@@ -577,7 +577,7 @@ def monitor():
                         pos['ref_time'] = now
                         pos['ref_price'] = price
 
-                # TP1: +1.5R → close 30%, SL to BE
+                # TP1: close TP1_SIZE_PCT of position, move SL to BE
                 if not pos['tp1_hit'] and float_r >= TP1_R:
                     tp1_size = round(pos['size'] * TP1_SIZE_PCT, 4)
                     if tp1_size >= 0.001:
@@ -586,9 +586,9 @@ def monitor():
                         pos['remaining'] -= tp1_size
                         pos['tp1_hit'] = True
                         pos['sl'] = entry
-                        tg(f'✂️ <b>TP1 {symbol} +{TP1_R}R</b>\nClosed 30% at ${price:,.4f}\nSL → BE ${entry:,.4f}')
+                        tg(f'✂️ <b>TP1 {symbol} +{TP1_R}R</b>\nClosed {int(TP1_SIZE_PCT*100)}% at ${price:,.4f}\nSL → BE ${entry:,.4f}')
 
-                # TP2: +3R → close 30%
+                # TP2: close TP2_SIZE_PCT of position
                 if pos['tp1_hit'] and not pos['tp2_hit'] and float_r >= TP2_R:
                     tp2_size = round(pos['size'] * TP2_SIZE_PCT, 4)
                     if tp2_size >= 0.001:
@@ -596,7 +596,7 @@ def monitor():
                         place_order(symbol, close_side, tp2_size, reduce_only=True)
                         pos['remaining'] -= tp2_size
                         pos['tp2_hit'] = True
-                        tg(f'✂️ <b>TP2 {symbol} +{TP2_R}R</b>\nClosed 30% at ${price:,.4f}\n40% trailing...')
+                        tg(f'✂️ <b>TP2 {symbol} +{TP2_R}R</b>\nClosed {int(TP2_SIZE_PCT*100)}% at ${price:,.4f}\n{int((1-TP1_SIZE_PCT-TP2_SIZE_PCT)*100)}% trailing...')
 
                 # Trailing Stop (after TP1)
                 if pos['tp1_hit']:
@@ -989,7 +989,7 @@ async def status():
             'timeframe': '5m', 'leverage': f'{LEVERAGE}x',
             'base_risk': '1%', 'high_vol_risk': '0.5%', 'streak_risk': '1.25%',
             'min_score': MIN_SCORE, 'sl': f'ATR×{SL_ATR_MULT}',
-            'tp1': f'+{TP1_R}R (30%)', 'tp2': f'+{TP2_R}R (30%)',
+            'tp1': f'+{TP1_R}R ({int(TP1_SIZE_PCT*100)}%)', 'tp2': f'+{TP2_R}R ({int(TP2_SIZE_PCT*100)}%)',
             'trail': f'ATR×{TRAIL_ATR_MULT}', 'daily_stop': f'-{DAILY_LOSS_LIMIT*100}%',
         }
     }
@@ -1021,7 +1021,7 @@ async def startup():
         f'Пары: {" | ".join(SYMBOLS)}\n'
         f'TF: 5m entry | 15m/1h/4h confirm\n'
         f'Risk: 1% base | 0.5% high-vol\n'
-        f'SL: ATR×1.5 | TP1: +1.5R | TP2: +3R\n'
+        f'SL: ATR×{SL_ATR_MULT} | TP1: +{TP1_R}R ({int(TP1_SIZE_PCT*100)}%) | TP2: +{TP2_R}R | Lev: {LEVERAGE}x\n'
         f'Filter: Score ≥75/100 | Daily stop: -10%'
     )
 
