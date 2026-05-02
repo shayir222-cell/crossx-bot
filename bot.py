@@ -93,9 +93,10 @@ def _make_pos():
 def _make_sym():
     return {'win_streak': 0, 'loss_streak': 0, 'pause_until': None, 'sl_cooldown_until': None}
 
-positions  = {s: _make_pos() for s in SYMBOLS}
-sym_state  = {s: _make_sym() for s in SYMBOLS}
-trades_log = []
+positions   = {s: _make_pos() for s in SYMBOLS}
+sym_state   = {s: _make_sym() for s in SYMBOLS}
+trades_log  = []
+signals_log = []  # every incoming webhook: taken or filtered, with full reason
 
 daily = {
     'date': '', 'start_balance': None, 'halted': False,
@@ -501,6 +502,25 @@ def record_result(symbol, won, pnl_pct):
 
 
 # ════════════════════════════════════════════════════════════
+# SIGNAL LOGGING (every webhook — taken or filtered)
+# ════════════════════════════════════════════════════════════
+def log_signal(symbol, action, score, breakdown, status, reason, session=''):
+    signals_log.append({
+        'time': datetime.now(timezone.utc).strftime('%H:%M'),
+        'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+        'symbol': symbol,
+        'action': action,
+        'score': score,
+        'breakdown': breakdown,
+        'status': status,   # 'taken', 'filtered', 'paused', 'halted', 'skipped'
+        'reason': reason,
+        'session': session,
+    })
+    if len(signals_log) > 500:
+        signals_log.pop(0)
+
+
+# ════════════════════════════════════════════════════════════
 # TRADE LOGGING
 # ════════════════════════════════════════════════════════════
 def log_trade(symbol, exit_price, exit_reason, won, pnl_pct):
@@ -777,23 +797,29 @@ async def webhook(request: Request):
         return JSONResponse({'error': f'unknown action: {action}'})
 
     # Guards
+    session_name, _ = get_session()
+
     if daily['halted']:
+        log_signal(symbol, action, 0, {}, 'halted', 'Daily loss limit', session_name)
         return JSONResponse({'status': 'halted', 'reason': 'Daily loss limit'})
 
     if is_session_blocked():
-        session_name, _ = get_session()
+        log_signal(symbol, action, 0, {}, 'filtered', f'{session_name} — low liquidity', session_name)
         return JSONResponse({'status': 'filtered', 'reason': f'{session_name} — trading blocked (low liquidity)'})
 
     paused, pause_reason = is_paused(symbol)
     if paused:
+        log_signal(symbol, action, 0, {}, 'paused', pause_reason, session_name)
         return JSONResponse({'status': 'paused', 'reason': pause_reason})
 
     if pos['active']:
+        log_signal(symbol, action, 0, {}, 'skipped', f'{symbol} position already open', session_name)
         return JSONResponse({'status': 'skipped', 'reason': f'{symbol} position already open'})
 
     side = 'long' if action == 'buy' else 'short'
     corr_blocked, corr_reason = is_correlated_blocked(symbol, side)
     if corr_blocked:
+        log_signal(symbol, action, 0, {}, 'filtered', corr_reason, session_name)
         return JSONResponse({'status': 'filtered', 'reason': corr_reason})
 
     # Balance
@@ -802,6 +828,7 @@ async def webhook(request: Request):
         return JSONResponse({'error': 'balance error'}, status_code=500)
 
     if check_daily_loss(balance):
+        log_signal(symbol, action, 0, {}, 'halted', 'Daily loss limit hit', session_name)
         return JSONResponse({'status': 'halted'})
 
     # Candles + ATR
@@ -817,28 +844,32 @@ async def webhook(request: Request):
     # Score
     score, breakdown = score_signal(symbol, side, candles_5m, data)
     if score < MIN_SCORE:
+        log_signal(symbol, action, score, breakdown, 'filtered', f'Score {score} < {MIN_SCORE}', session_name)
         print(f'[FILTER] {symbol} Score {score}/100 < {MIN_SCORE}')
         return JSONResponse({'status': 'filtered', 'score': score, 'reason': f'Score {score}/100 < {MIN_SCORE}', 'breakdown': breakdown})
 
     # MTF gate
     mtf_ok, mtf_info = check_mtf(symbol, side)
     if not mtf_ok:
+        log_signal(symbol, action, score, breakdown, 'filtered', f'MTF: {mtf_info}', session_name)
         return JSONResponse({'status': 'filtered', 'reason': mtf_info})
 
     # News filter
     news_ok, news_reason = check_news()
     if not news_ok:
+        log_signal(symbol, action, score, breakdown, 'filtered', f'News: {news_reason}', session_name)
         tg(f'📰 <b>News Filter</b>\n{news_reason}')
         return JSONResponse({'status': 'filtered', 'reason': news_reason})
 
-    # Session
-    session_name, risk_mult = get_session()
+    # Session risk multiplier
+    _, risk_mult = get_session()
     high_vol = is_high_volatility(atr, price)
 
     # ATR volatility filter — skip if market too quiet (per-symbol threshold)
     atr_pct     = atr / price
     min_atr_pct = MIN_ATR_PCT.get(symbol, 0.0005)
     if atr_pct < min_atr_pct:
+        log_signal(symbol, action, score, breakdown, 'filtered', f'ATR {atr_pct*100:.3f}% < min {min_atr_pct*100:.3f}%', session_name)
         print(f'[FILTER] {symbol} ATR {atr_pct*100:.3f}% < {min_atr_pct*100:.3f}% (market too quiet)')
         return JSONResponse({'status': 'filtered', 'reason': f'{symbol} ATR {atr_pct*100:.3f}% < {min_atr_pct*100:.3f}% — market too quiet'})
 
@@ -864,6 +895,10 @@ async def webhook(request: Request):
         sl_price  = round(price + sl_dist, 4)
         tp1_price = round(price - sl_dist * TP1_R, 4)
         tp2_price = round(price - sl_dist * TP2_R, 4)
+
+    # Log signal as taken before placing order
+    log_signal(symbol, action, score, breakdown, 'taken',
+               f'Entry ${price:.4f} | ATR {atr_pct*100:.3f}% | risk {risk_pct*100:.2f}%', session_name)
 
     # Place order
     set_leverage(symbol)
@@ -1038,6 +1073,47 @@ async def status():
             'trail': f'ATR×{TRAIL_ATR_MULT}', 'daily_stop': f'-{DAILY_LOSS_LIMIT*100}%',
         }
     }
+
+@app.get('/signals')
+async def get_signals():
+    total = len(signals_log)
+    taken = [s for s in signals_log if s['status'] == 'taken']
+    filtered = [s for s in signals_log if s['status'] == 'filtered']
+    paused = [s for s in signals_log if s['status'] == 'paused']
+
+    # Filter reason breakdown
+    reasons = {}
+    for s in filtered + paused:
+        key = s['reason'].split('—')[0].split(':')[0].strip()[:40]
+        reasons[key] = reasons.get(key, 0) + 1
+
+    # Score distribution of filtered signals
+    scored_filtered = [s for s in filtered if s['score'] > 0]
+    avg_filtered_score = round(sum(s['score'] for s in scored_filtered) / len(scored_filtered), 1) if scored_filtered else 0
+    avg_taken_score = round(sum(s['score'] for s in taken) / len(taken), 1) if taken else 0
+
+    # By symbol
+    by_symbol = {}
+    for sym in SYMBOLS:
+        sym_sigs = [s for s in signals_log if s['symbol'] == sym]
+        by_symbol[sym] = {
+            'total': len(sym_sigs),
+            'taken': len([s for s in sym_sigs if s['status'] == 'taken']),
+            'filtered': len([s for s in sym_sigs if s['status'] != 'taken']),
+        }
+
+    return {
+        'total_signals': total,
+        'taken': len(taken),
+        'filtered': len(filtered) + len(paused),
+        'filter_rate': f'{(len(filtered)+len(paused))/total*100:.0f}%' if total else '0%',
+        'avg_score_taken': avg_taken_score,
+        'avg_score_filtered': avg_filtered_score,
+        'filter_reasons': reasons,
+        'by_symbol': by_symbol,
+        'last_10': signals_log[-10:][::-1],
+    }
+
 
 @app.get('/reset-daily')
 async def reset_daily_endpoint():
