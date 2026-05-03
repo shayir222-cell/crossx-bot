@@ -36,20 +36,20 @@ MIN_ATR_PCT = {
 }
 
 # ─── Risk ────────────────────────────────────────────────
-BASE_RISK_PCT    = 0.01
-HIGH_VOL_RISK    = 0.005
-STREAK_RISK      = 0.0125
+BASE_RISK_PCT    = 0.0075  # 1.0%→0.75%: SL wider so dollar risk stays ~same
+HIGH_VOL_RISK    = 0.004
+STREAK_RISK      = 0.01
 LEVERAGE         = 7     # 10→7: reduces notional 30% → fees 30% lower
 DAILY_LOSS_LIMIT = 0.10
 
 # ─── ATR levels ──────────────────────────────────────────
-SL_ATR_MULT    = 1.5
-TP1_R          = 2.5   # 1.5→2.5: first TP profit must outpace open+close fees
-TP2_R          = 5.0   # 3.0→5.0: let full winners run
-TRAIL_ATR_MULT = 1.5   # 1.0→1.5: tighter trail protects more peak profit
-MAX_GIVEBACK   = 0.30  # 0.35→0.30: give back less at peak
-TP1_SIZE_PCT   = 0.40  # 0.30→0.40: lock in more at first TP
-TP2_SIZE_PCT   = 0.30  # unchanged
+SL_ATR_MULT    = 2.0   # 1.5→2.0: wider SL avoids false stops
+TP1_R          = 2.5   # unchanged: first TP at 2.5R
+TP2_R          = 5.0   # unchanged: let full winners run
+TRAIL_ATR_MULT = 1.0   # 1.5→1.0: tighter trail after TP1 captures more peak
+MAX_GIVEBACK   = 0.25  # 0.30→0.25: give back even less at peak
+TP1_SIZE_PCT   = 0.50  # 0.40→0.50: lock in half at first TP
+TP2_SIZE_PCT   = 0.50  # 0.30→0.50: close full remainder at TP2
 
 # ─── Score ───────────────────────────────────────────────
 MIN_SCORE = 82  # 75→82: only high-confidence setups
@@ -72,7 +72,7 @@ CORR_GROUPS = [
 ]
 
 # ─── Time stop ───────────────────────────────────────────
-TIME_STOP_MIN  = 30
+TIME_STOP_MIN  = 90   # 30→90: give trades time to develop
 TIME_STOP_MOVE = 0.003
 
 
