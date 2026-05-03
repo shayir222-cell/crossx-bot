@@ -119,6 +119,153 @@ def tg(text: str):
     except Exception as e:
         print(f'[TG] {e}')
 
+def tg_to(chat_id, text: str):
+    if not TG_TOKEN:
+        return
+    try:
+        requests.post(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'},
+            timeout=5
+        )
+    except Exception as e:
+        print(f'[TG] {e}')
+
+def get_tg_updates(offset):
+    if not TG_TOKEN:
+        return []
+    try:
+        r = requests.get(
+            f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates',
+            params={'offset': offset, 'timeout': 20},
+            timeout=25
+        )
+        return r.json().get('result', [])
+    except:
+        return []
+
+def generate_advisor_comment():
+    lines = []
+    recent = trades_log[-10:]
+
+    if recent:
+        wins = sum(1 for t in recent if t['won'])
+        wr = wins / len(recent) * 100
+        if wr >= 60:
+            lines.append(f'✅ Win rate {wr:.0f}% — стратегия работает хорошо')
+        elif wr >= 40:
+            lines.append(f'⚠️ Win rate {wr:.0f}% — нейтрально, накапливаем данные')
+        else:
+            lines.append(f'❌ Win rate {wr:.0f}% — рассмотри снижение MIN_SCORE до 80')
+
+        time_stops = sum(1 for t in recent if t.get('exit_reason') == 'Time Stop')
+        if time_stops > len(recent) * 0.4:
+            lines.append(f'⏱ {time_stops}/{len(recent)} сделок — Time Stop (рынок боковой)')
+
+        tp1_hits = sum(1 for t in recent if t.get('tp1_hit'))
+        if tp1_hits:
+            lines.append(f'🎯 TP1 достигнут: {tp1_hits}/{len(recent)} сделок')
+
+        avg_pnl = sum(t.get('pnl_pct', 0) for t in recent) / len(recent)
+        lines.append(f'📊 Avg PnL на сделку: {avg_pnl:+.3f}%')
+    else:
+        lines.append('📊 Нет завершённых сделок — накапливаем статистику')
+
+    if signals_log:
+        scored = [s for s in signals_log if s['score'] > 0 and s['status'] == 'filtered']
+        if scored:
+            avg_sc = sum(s['score'] for s in scored) / len(scored)
+            max_sc = max(s['score'] for s in scored)
+            lines.append(f'🔍 Отфильтрованные сигналы: avg {avg_sc:.0f} / max {max_sc}/100')
+            if max_sc >= 80:
+                lines.append('💡 Есть сигналы 80-81 — если мало сделок, рассмотри порог 80')
+
+    active_count = sum(1 for p in positions.values() if p['active'])
+    if active_count:
+        lines.append(f'📌 Открытых позиций: {active_count}')
+
+    return '\n'.join(lines)
+
+def send_dashboard(chat_id=None):
+    target = chat_id or TG_CHAT_ID
+    if not target:
+        return
+
+    bal = get_balance()
+    today = str(date.today())
+    today_trades = [t for t in trades_log if t.get('date') == today]
+    today_wins   = sum(1 for t in today_trades if t['won'])
+    today_losses = len(today_trades) - today_wins
+    today_pnl    = sum(t.get('pnl_pct', 0) for t in today_trades)
+
+    session_name, _ = get_session()
+    halt_txt = '🛑 HALT' if daily['halted'] else '✅ Активен'
+
+    pos_lines = []
+    for sym, p in positions.items():
+        if p['active']:
+            price = get_price(sym) or p['entry']
+            if p['side'] == 'long':
+                float_r = (price - p['entry']) / p['r'] if p['r'] else 0
+            else:
+                float_r = (p['entry'] - price) / p['r'] if p['r'] else 0
+            pos_lines.append(
+                f"  {'🟢' if p['side']=='long' else '🔴'} {sym} "
+                f"@ ${p['entry']:,.1f} | {float_r:+.2f}R | Score {p['score']}"
+            )
+    pos_text = '\n'.join(pos_lines) if pos_lines else '  Нет активных позиций'
+
+    text = (
+        f'📊 <b>CrossX Pro Dashboard</b>\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'💰 Баланс: <b>${bal:,.2f}</b>\n'
+        f'📈 PnL сегодня: <b>{today_pnl:+.3f}%</b>\n'
+        f'🔄 Сделок: {len(today_trades)}  ✅{today_wins} / ❌{today_losses}\n'
+        f'🕐 Сессия: {session_name}\n'
+        f'🤖 Статус: {halt_txt}\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'<b>Позиции:</b>\n{pos_text}\n'
+        f'━━━━━━━━━━━━━━━━━━━\n'
+        f'🧠 <b>Советник:</b>\n{generate_advisor_comment()}'
+    )
+    tg_to(target, text)
+
+_tg_offset = 0
+_last_eod_date = ''
+
+def tg_polling():
+    global _tg_offset, _last_eod_date
+    while True:
+        try:
+            updates = get_tg_updates(_tg_offset)
+            for upd in updates:
+                _tg_offset = upd['update_id'] + 1
+                msg  = upd.get('message', {})
+                text = msg.get('text', '').strip()
+                cid  = str(msg.get('chat', {}).get('id', ''))
+                if not cid:
+                    continue
+                if text in ('/dashboard', '/d', '/status'):
+                    send_dashboard(cid)
+                elif text == '/start':
+                    tg_to(cid,
+                        '🤖 <b>CrossX Pro Bot</b>\n\n'
+                        'Команды:\n'
+                        '/dashboard — дашборд + советник\n'
+                        '/d — то же самое (короче)\n'
+                    )
+        except Exception as e:
+            print(f'[TG POLL] {e}')
+
+        # End-of-day summary at 21:05 UTC (after NY close)
+        now = datetime.now(timezone.utc)
+        today = str(date.today())
+        if now.hour == 21 and now.minute == 5 and _last_eod_date != today:
+            _last_eod_date = today
+            send_dashboard()
+
+        time.sleep(3)
+
 
 # ════════════════════════════════════════════════════════════
 # BITGET API
@@ -380,8 +527,8 @@ def get_session():
     if in_ld and in_ny: return 'London/NY Overlap', 1.0
     elif in_ld:         return 'London', 1.0
     elif in_ny:         return 'New York', 1.0
-    elif 0 <= h < 7:    return 'Asian', 0.0   # blocked: low liquidity + fee drain
-    else:               return 'Off-session', 0.0  # blocked: pre-London dead zone
+    elif 0 <= h < 7:    return 'Asian', 1.0   # enabled: score+ATR filters protect quality
+    else:               return 'Off-session', 0.0  # blocked: 21-00 UTC dead zone
 
 def is_session_blocked():
     _, mult = get_session()
@@ -1135,15 +1282,17 @@ async def startup():
     _sync_time()
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
-    print('[BOT] CrossX Pro Bot v3.0 started —', ', '.join(SYMBOLS))
+    threading.Thread(target=tg_polling, daemon=True).start()
+    print('[BOT] CrossX Pro Bot v3.1 started —', ', '.join(SYMBOLS))
     tg(
-        '🚀 <b>CrossX Pro Bot v3.0 Online</b>\n'
+        '🚀 <b>CrossX Pro Bot v3.1 Online</b>\n'
         '━━━━━━━━━━━━━━━━━━━\n'
         f'Пары: {" | ".join(SYMBOLS)}\n'
-        f'TF: 5m entry | 15m/1h/4h confirm\n'
-        f'Risk: 1% base | 0.5% high-vol\n'
-        f'SL: ATR×{SL_ATR_MULT} | TP1: +{TP1_R}R ({int(TP1_SIZE_PCT*100)}%) | TP2: +{TP2_R}R | Lev: {LEVERAGE}x\n'
-        f'Filter: Score ≥75/100 | Daily stop: -10%'
+        f'Сессии: Asian + London + NY\n'
+        f'Risk: {int(BASE_RISK_PCT*100)}% base | SL: ATR×{SL_ATR_MULT}\n'
+        f'TP1: +{TP1_R}R ({int(TP1_SIZE_PCT*100)}%) | TP2: +{TP2_R}R | Lev: {LEVERAGE}x\n'
+        f'Score ≥{MIN_SCORE} | Daily stop: -{int(DAILY_LOSS_LIMIT*100)}%\n'
+        f'Команды: /dashboard — дашборд + советник'
     )
 
 
