@@ -52,7 +52,7 @@ TP1_SIZE_PCT   = 0.50  # 0.40→0.50: lock in half at first TP
 TP2_SIZE_PCT   = 0.50  # 0.30→0.50: close full remainder at TP2
 
 # ─── Score ───────────────────────────────────────────────
-MIN_SCORE = 82  # 75→82: only high-confidence setups
+MIN_SCORE = 80  # 82→80: more trades for data accumulation
 
 # ─── Sessions (UTC hours) ────────────────────────────────
 LONDON_OPEN  = 7
