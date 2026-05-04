@@ -88,6 +88,7 @@ def _make_pos():
         'peak_pnl': 0.0, 'trail_sl': None,
         'entry_time': None, 'ref_price': 0.0, 'ref_time': None,
         'score': 0, 'session': '',
+        'be_set': False,
     }
 
 def _make_sym():
@@ -707,7 +708,8 @@ def reset_pos(symbol):
         active=False, side=None, entry=0.0, size=0.0, remaining=0.0,
         sl=0.0, atr=0.0, r=0.0, tp1_hit=False, tp2_hit=False,
         peak_pnl=0.0, trail_sl=None, entry_time=None,
-        ref_price=0.0, ref_time=None, score=0, session=''
+        ref_price=0.0, ref_time=None, score=0, session='',
+        be_set=False,
     )
 
 
@@ -765,22 +767,34 @@ def monitor():
                         reset_pos(symbol)
                         continue
 
-                # Time Stop
+                # Time Stop — only fires when position is at a loss
                 if pos['ref_time'] is None:
                     pos['ref_time'] = now
                     pos['ref_price'] = price
                 elif (now - pos['ref_time']).seconds >= TIME_STOP_MIN * 60:
                     move = abs(price - pos['ref_price']) / pos['ref_price']
                     if move < TIME_STOP_MOVE:
-                        close_all(symbol, side)
-                        tg(f'⏱ <b>TIME STOP {symbol}</b>\n{TIME_STOP_MIN}min, move {move*100:.2f}%\n${price:,.4f}')
-                        log_trade(symbol, price, 'Time Stop', pnl_pct > 0, pnl_pct)
-                        record_result(symbol, pnl_pct > 0, pnl_pct)
-                        reset_pos(symbol)
-                        continue
+                        if pnl_pct >= 0:
+                            # Profitable trade going sideways — reset clock, let SL/TP handle it
+                            pos['ref_time'] = now
+                            pos['ref_price'] = price
+                        else:
+                            # Loss + no movement → exit to limit damage
+                            close_all(symbol, side)
+                            tg(f'⏱ <b>TIME STOP {symbol}</b>\n{TIME_STOP_MIN}min, move {move*100:.2f}%\n${price:,.4f} | PnL:{pnl_pct:+.2f}%')
+                            log_trade(symbol, price, 'Time Stop', False, pnl_pct)
+                            record_result(symbol, False, pnl_pct)
+                            reset_pos(symbol)
+                            continue
                     else:
                         pos['ref_time'] = now
                         pos['ref_price'] = price
+
+                # Break-Even SL at +1.0R (before TP1) — prevents reversals turning winners into losers
+                if not pos['be_set'] and float_r >= 1.0:
+                    pos['sl'] = entry
+                    pos['be_set'] = True
+                    tg(f'⚡ <b>BE {symbol}</b>\n+1.0R → SL → BE ${entry:,.4f}')
 
                 # TP1: close TP1_SIZE_PCT of position, move SL to BE
                 if not pos['tp1_hit'] and float_r >= TP1_R:
@@ -801,7 +815,8 @@ def monitor():
                         place_order(symbol, close_side, tp2_size, reduce_only=True)
                         pos['remaining'] -= tp2_size
                         pos['tp2_hit'] = True
-                        tg(f'✂️ <b>TP2 {symbol} +{TP2_R}R</b>\nClosed {int(TP2_SIZE_PCT*100)}% at ${price:,.4f}\n{int((1-TP1_SIZE_PCT-TP2_SIZE_PCT)*100)}% trailing...')
+                        remaining_pct = int((1 - TP1_SIZE_PCT) * (1 - TP2_SIZE_PCT) * 100)
+                        tg(f'✂️ <b>TP2 {symbol} +{TP2_R}R</b>\nClosed {int(TP2_SIZE_PCT*100)}% at ${price:,.4f}\n{remaining_pct}% trailing...')
 
                 # Trailing Stop (after TP1)
                 if pos['tp1_hit']:
