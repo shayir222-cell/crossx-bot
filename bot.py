@@ -756,8 +756,8 @@ def monitor():
                     reset_pos(symbol)
                     continue
 
-                # Max Giveback
-                if pos['peak_pnl'] > 0.5:
+                # Max Giveback — only after TP1 is hit; before TP1, BE SL handles protection
+                if pos['tp1_hit'] and pos['peak_pnl'] > 0.5:
                     giveback = (pos['peak_pnl'] - pnl_pct) / pos['peak_pnl']
                     if giveback >= MAX_GIVEBACK:
                         close_all(symbol, side)
@@ -968,6 +968,11 @@ async def webhook(request: Request):
     if is_session_blocked():
         log_signal(symbol, action, 0, {}, 'filtered', f'{session_name} — low liquidity', session_name)
         return JSONResponse({'status': 'filtered', 'reason': f'{session_name} — trading blocked (low liquidity)'})
+
+    # Asian session (0-7 UTC): longs only — crypto has upward bias in Asian hours
+    if session_name == 'Asian' and side == 'short':
+        log_signal(symbol, action, 0, {}, 'filtered', 'Asian session — shorts blocked (upward bias)', session_name)
+        return JSONResponse({'status': 'filtered', 'reason': 'Asian session — shorts blocked'})
 
     paused, pause_reason = is_paused(symbol)
     if paused:
