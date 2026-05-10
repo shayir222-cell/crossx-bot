@@ -29,6 +29,7 @@ TG_CHAT_ID    = os.environ.get('TG_CHAT_ID', '')
 RENDER_URL    = os.environ.get('RENDER_URL', '')
 DB_PATH       = os.environ.get('DB_PATH', './crossx.db')
 LOG_DIR       = os.environ.get('LOG_DIR', '/var/data/logs' if os.path.exists('/var/data') else './logs')
+FILL_RECONCILER = None  # populated when ENABLE_FILL_TRACKING and listener starts
 
 # ─── P1 v3.7 Stability validation feature flags ──────────────────
 def _flag(name, default):
@@ -1737,6 +1738,18 @@ async def webhook(request: Request):
                      entry=price, sl=sl_price, score=score, session=session_name,
                      latency_ms=latency_ms, risk_pct=round(risk_pct * 100, 2))
 
+    # Register with fill reconciler (if fill tracking enabled). Isolated from trade flow.
+    if FILL_RECONCILER is not None:
+        try:
+            order_id = (result.get('data') or {}).get('orderId') if isinstance(result, dict) else None
+            if order_id:
+                FILL_RECONCILER.register_pending_order(
+                    order_id=order_id, symbol=symbol, side=side,
+                    expected_price=price, ts_submitted=t_signal,
+                )
+        except Exception:
+            pass  # never affect trading
+
     # Update state
     now = datetime.now(timezone.utc)
     positions[symbol].update(
@@ -2388,6 +2401,22 @@ async def startup():
     except Exception as e:
         print(f'[STARTUP] DB init/restore failed (non-fatal): {e}')
         logger.log_error('startup_db_failure', error=str(e))
+
+    # P1 v3.7 — fill tracking (optional, off by default).
+    # MUST be isolated from trading hot path. Failure to start does NOT
+    # affect trading.
+    if ENABLE_FILL_TRACKING:
+        try:
+            import execution_fills
+            from fill_reconciler import FillReconciler
+            global FILL_RECONCILER
+            FILL_RECONCILER = FillReconciler(db_module=db, metrics_module=metrics)
+            execution_fills.set_reconciler(FILL_RECONCILER)
+            execution_fills.start_listener(API_KEY, API_SECRET, PASSPHRASE)
+            logger.log_event('fill_tracking_started')
+        except Exception as e:
+            print(f'[STARTUP] fill tracker failed (non-fatal): {e}')
+            logger.log_error('startup_fill_tracker_failure', error=str(e))
 
     # P1 v3.7 — soak validator (optional, off by default)
     if ENABLE_SOAK_VALIDATION:
