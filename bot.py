@@ -5,9 +5,11 @@ Bitget Futures | 5m Timeframe
 """
 import os, json, time, hmac, hashlib, base64, threading
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from datetime import datetime, date, timezone, timedelta
+
+import db  # SQLite persistence layer
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -21,6 +23,7 @@ WEBHOOK_TOKEN = os.environ.get('WEBHOOK_TOKEN', 'change_me')
 TG_TOKEN      = os.environ.get('TG_TOKEN', '')
 TG_CHAT_ID    = os.environ.get('TG_CHAT_ID', '')
 RENDER_URL    = os.environ.get('RENDER_URL', '')
+DB_PATH       = os.environ.get('DB_PATH', './crossx.db')
 
 BASE_URL = 'https://api.bitget.com'
 
@@ -508,6 +511,51 @@ def close_all(symbol, hold_side):
         'symbol': symbol, 'productType': 'USDT-FUTURES', 'holdSide': hold_side,
     })
 
+def close_position_safe(symbol, hold_side):
+    """Verified close with one retry. Returns (ok: bool, response: dict).
+
+    Bitget code '00000' = success. Anything else = retry once after 1s.
+    On final failure, alert TG and write a 'close_failed' execution metric so
+    next monitor tick can retry naturally (we do NOT reset_pos on failure).
+    """
+    res = close_all(symbol, hold_side)
+    code = (res or {}).get('code') if isinstance(res, dict) else None
+    if code == '00000':
+        return True, res
+
+    # one retry after brief pause (rate-limit / transient network)
+    time.sleep(1)
+    res2 = close_all(symbol, hold_side)
+    code2 = (res2 or {}).get('code') if isinstance(res2, dict) else None
+    if code2 == '00000':
+        return True, res2
+
+    err = ((res2 or res) or {}).get('msg', 'unknown') if isinstance((res2 or res), dict) else 'unknown'
+    tg(f'⚠️ <b>CLOSE FAILED {symbol}</b>\n'
+       f'side: {hold_side.upper()} | Bitget: {err}\n'
+       f'Will retry on next monitor tick (15s).')
+    log_execution(symbol, hold_side, time.time(), time.time(), 0, 0, 'close_failed', str(err)[:120])
+    print(f'[CLOSE FAILED] {symbol} {hold_side} -> {err}')
+    return False, res2
+
+def get_all_positions_bitget():
+    """Returns dict {symbol: {side, total}} of all open positions on Bitget. Used for startup reconciliation."""
+    d = api_get('/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT')
+    out = {}
+    if d.get('code') == '00000' and d.get('data'):
+        for row in d['data']:
+            try:
+                sym = row.get('symbol', '')
+                total = float(row.get('total', 0) or 0)
+                if total <= 0:
+                    continue
+                side = row.get('holdSide', '')  # 'long' or 'short'
+                if sym and side:
+                    out[sym] = {'side': side, 'total': total}
+            except Exception:
+                continue
+    return out
+
 
 # ════════════════════════════════════════════════════════════
 # TECHNICAL ANALYSIS
@@ -733,15 +781,18 @@ def reset_daily():
                      loss_streak=0, streak_pause_until=None,
                      last_close_time=None, peak_pnl=0.0)
         print(f'[DAY] New day: {today}')
+        db.save_state_global(daily)  # dual-write
 
 def check_daily_loss(balance):
     equity = get_equity() or balance  # use total equity, not just available
     if daily['start_balance'] is None:
         daily['start_balance'] = equity
+        db.save_state_global(daily)  # persist start_balance immediately
         return False
     lost = (daily['start_balance'] - equity) / daily['start_balance']
     if lost >= DAILY_LOSS_LIMIT:
         daily['halted'] = True
+        db.save_state_global(daily)  # persist halt flag
         tg(f'🛑 <b>DAILY STOP</b>\nLoss: <b>-{lost*100:.1f}%</b>\nEquity: ${equity:.2f}\nStopped until tomorrow.')
         return True
     return False
@@ -863,7 +914,7 @@ def is_duplicate_signal(symbol, side):
 def log_execution(symbol, side, t_signal, t_entry, requested_price, fill_price, status, reason=''):
     latency_ms = int((t_entry - t_signal) * 1000) if t_signal else 0
     slippage_pct = abs(fill_price - requested_price) / requested_price * 100 if requested_price else 0.0
-    metrics_log.append({
+    entry = {
         'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         'symbol': symbol, 'side': side,
         'latency_ms': latency_ms,
@@ -872,9 +923,11 @@ def log_execution(symbol, side, t_signal, t_entry, requested_price, fill_price, 
         'filled': fill_price,
         'status': status,
         'reason': reason,
-    })
+    }
+    metrics_log.append(entry)
     if len(metrics_log) > 500:
         metrics_log.pop(0)
+    db.save_metric(entry)  # dual-write
 
 def get_risk_pct(score, atr, price):
     if is_high_volatility(atr, price):
@@ -936,12 +989,16 @@ def record_result(symbol, won, pnl_pct):
     if daily['pnl'] > daily.get('peak_pnl', 0.0):
         daily['peak_pnl'] = daily['pnl']
 
+    # Phase B — dual-write state
+    db.save_state_global(daily)
+    db.save_state_symbol(symbol, sym_state[symbol])
+
 
 # ════════════════════════════════════════════════════════════
 # SIGNAL LOGGING (every webhook — taken or filtered)
 # ════════════════════════════════════════════════════════════
 def log_signal(symbol, action, score, breakdown, status, reason, session=''):
-    signals_log.append({
+    entry = {
         'time': datetime.now(timezone.utc).strftime('%H:%M'),
         'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
         'symbol': symbol,
@@ -951,9 +1008,11 @@ def log_signal(symbol, action, score, breakdown, status, reason, session=''):
         'status': status,   # 'taken', 'filtered', 'paused', 'halted', 'skipped'
         'reason': reason,
         'session': session,
-    })
+    }
+    signals_log.append(entry)
     if len(signals_log) > 500:
         signals_log.pop(0)
+    db.save_signal(entry)  # dual-write
 
 
 # ════════════════════════════════════════════════════════════
@@ -985,6 +1044,7 @@ def log_trade(symbol, exit_price, exit_reason, won, pnl_pct):
     trades_log.append(trade)
     if len(trades_log) > 1000:
         trades_log.pop(0)
+    db.save_trade(trade)  # dual-write
     print(f'[TRADE #{trade["id"]}] {symbol} {trade["side"].upper()} | {exit_reason} | PnL:{pnl_pct:+.3f}%')
 
 
@@ -999,6 +1059,7 @@ def reset_pos(symbol):
         ref_price=0.0, ref_time=None, score=0, session='',
         be_set=False,
     )
+    db.clear_position(symbol)  # dual-write
 
 
 # ════════════════════════════════════════════════════════════
@@ -1037,7 +1098,10 @@ def monitor():
                 sl_hit = (side == 'long' and price <= pos['sl']) or \
                          (side == 'short' and price >= pos['sl'])
                 if sl_hit:
-                    close_all(symbol, side)
+                    ok, _ = close_position_safe(symbol, side)
+                    if not ok:
+                        # Position still on Bitget — keep state active so next tick retries
+                        continue
                     tg(f'🔴 <b>SL {symbol}</b>\n${price:,.4f} | SL ${pos["sl"]:,.4f}\nPnL: {pnl_pct:+.2f}%')
                     log_trade(symbol, price, 'SL', False, pnl_pct)
                     record_result(symbol, False, pnl_pct)
@@ -1048,7 +1112,9 @@ def monitor():
                 if pos['tp1_hit'] and pos['peak_pnl'] > 0.5:
                     giveback = (pos['peak_pnl'] - pnl_pct) / pos['peak_pnl']
                     if giveback >= MAX_GIVEBACK:
-                        close_all(symbol, side)
+                        ok, _ = close_position_safe(symbol, side)
+                        if not ok:
+                            continue
                         tg(f'💰 <b>MAX GIVEBACK {symbol}</b>\nPeak:{pos["peak_pnl"]:.2f}% → {pnl_pct:.2f}%\n${price:,.4f}')
                         log_trade(symbol, price, 'Max Giveback', pnl_pct > 0, pnl_pct)
                         record_result(symbol, pnl_pct > 0, pnl_pct)
@@ -1068,7 +1134,9 @@ def monitor():
                             pos['ref_price'] = price
                         else:
                             # Loss + no movement → exit to limit damage
-                            close_all(symbol, side)
+                            ok, _ = close_position_safe(symbol, side)
+                            if not ok:
+                                continue
                             tg(f'⏱ <b>TIME STOP {symbol}</b>\n{TIME_STOP_MIN}min, move {move*100:.2f}%\n${price:,.4f} | PnL:{pnl_pct:+.2f}%')
                             log_trade(symbol, price, 'Time Stop', False, pnl_pct)
                             record_result(symbol, False, pnl_pct)
@@ -1114,7 +1182,9 @@ def monitor():
                         if pos['trail_sl'] is None or new_trail > pos['trail_sl']:
                             pos['trail_sl'] = new_trail
                         if price <= pos['trail_sl']:
-                            close_all(symbol, 'long')
+                            ok, _ = close_position_safe(symbol, 'long')
+                            if not ok:
+                                continue
                             tg(f'📉 <b>TRAIL {symbol}</b>\n${price:,.4f} | Trail ${pos["trail_sl"]:,.4f}\nPnL:{pnl_pct:+.2f}%')
                             log_trade(symbol, price, 'Trailing Stop', pnl_pct > 0, pnl_pct)
                             record_result(symbol, pnl_pct > 0, pnl_pct)
@@ -1125,11 +1195,18 @@ def monitor():
                         if pos['trail_sl'] is None or new_trail < pos['trail_sl']:
                             pos['trail_sl'] = new_trail
                         if price >= pos['trail_sl']:
-                            close_all(symbol, 'short')
+                            ok, _ = close_position_safe(symbol, 'short')
+                            if not ok:
+                                continue
                             tg(f'📉 <b>TRAIL {symbol}</b>\n${price:,.4f}\nPnL:{pnl_pct:+.2f}%')
                             log_trade(symbol, price, 'Trailing Stop', pnl_pct > 0, pnl_pct)
                             record_result(symbol, pnl_pct > 0, pnl_pct)
                             reset_pos(symbol)
+                            continue
+
+                # Phase B — dual-write current position state on every active monitor tick
+                # (peak_pnl, trail_sl, tp1_hit, be_set, sl могут меняться → персистим)
+                db.upsert_position(symbol, pos)
 
             except Exception as e:
                 print(f'[MONITOR ERROR] {symbol}: {e}')
@@ -1232,7 +1309,9 @@ async def webhook(request: Request):
     if action in ('close_long', 'close_short'):
         if pos['active']:
             side = 'long' if action == 'close_long' else 'short'
-            close_all(symbol, side)
+            ok, resp = close_position_safe(symbol, side)
+            if not ok:
+                return JSONResponse({'status': 'close_failed', 'reason': str(resp)[:200]}, status_code=500)
             price = get_price(symbol) or pos['entry']
             pnl_pct = 0.0
             if price and pos['entry']:
@@ -1407,7 +1486,9 @@ async def webhook(request: Request):
         tp1_hit=False, tp2_hit=False, peak_pnl=0.0, trail_sl=None,
         entry_time=now, ref_price=price, ref_time=now,
         score=score, session=session_name,
+        be_set=False,
     )
+    db.upsert_position(symbol, positions[symbol])  # dual-write
 
     emoji = '🟢' if side == 'long' else '🔴'
     breakdown_str = '\n'.join([f'  {k}: {v}' for k, v in breakdown.items()])
@@ -1621,7 +1702,40 @@ async def reset_daily_endpoint():
                  trades=0, wins=0, losses=0, pnl=0.0,
                  loss_streak=0, streak_pause_until=None,
                  last_close_time=None, peak_pnl=0.0)
+    db.save_state_global(daily)  # dual-write
     return {'status': 'daily stats reset', 'date': daily['date']}
+
+
+def _check_auth(token):
+    """Validate header token against WEBHOOK_TOKEN. Constant-time compare to prevent timing leaks."""
+    if not WEBHOOK_TOKEN or WEBHOOK_TOKEN == 'change_me':
+        return False
+    return hmac.compare_digest(str(token or ''), WEBHOOK_TOKEN)
+
+
+@app.get('/backup')
+async def backup_endpoint(x_auth_token: str = Header(default='')):
+    """JSON snapshot of recent persisted state. Header X-Auth-Token: <WEBHOOK_TOKEN>."""
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    return {
+        'db_path': db.db_path(),
+        'db_ready': db.is_ready(),
+        'counts': db.stats(),
+        'trades_recent': db.load_trades(200),
+        'signals_recent': db.load_signals(100),
+        'metrics_recent': db.load_metrics(100),
+        'positions_active': db.load_active_positions(),
+        'state_global': db.load_state_global(),
+        'state_symbol': {s: db.load_state_symbol(s) for s in SYMBOLS},
+    }
+
+
+@app.get('/db-stats')
+async def db_stats_endpoint(x_auth_token: str = Header(default='')):
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    return {'db_path': db.db_path(), 'ready': db.is_ready(), 'counts': db.stats()}
 
 
 @app.get('/daily-report')
@@ -1650,24 +1764,140 @@ async def home():
 
 
 # ════════════════════════════════════════════════════════════
+# STATE RESTORATION & RECONCILIATION (Phase B — SQLite persistence)
+# ════════════════════════════════════════════════════════════
+def restore_state():
+    """Load persisted state into in-memory globals on startup. Safe if DB empty."""
+    if not db.is_ready():
+        return
+
+    # Trades — full history needed for /report stats
+    persisted_trades = db.load_trades(1000) or []
+    if persisted_trades:
+        trades_log.extend(persisted_trades)
+        print(f'[DB] restored {len(persisted_trades)} trades')
+
+    # Signals — recent only (for /signals analytics + dedupe context)
+    persisted_sigs = db.load_signals(500) or []
+    if persisted_sigs:
+        signals_log.extend(persisted_sigs)
+        print(f'[DB] restored {len(persisted_sigs)} signals')
+
+    # Metrics — recent
+    persisted_metrics = db.load_metrics(500) or []
+    if persisted_metrics:
+        metrics_log.extend(persisted_metrics)
+        print(f'[DB] restored {len(persisted_metrics)} metrics')
+
+    # Global daily state — restore ONLY if DB date == today UTC, else fresh start
+    g = db.load_state_global() or {}
+    today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if g.get('date') == today_utc:
+        for k in ('start_balance', 'halted', 'trades', 'wins', 'losses',
+                  'pnl', 'loss_streak', 'peak_pnl'):
+            if k in g and g[k] is not None:
+                daily[k] = g[k]
+        for k in ('streak_pause_until', 'last_close_time'):
+            v = g.get(k)
+            if isinstance(v, str):
+                try:
+                    daily[k] = datetime.fromisoformat(v)
+                except Exception:
+                    daily[k] = None
+            elif v is None:
+                daily[k] = None
+        daily['date'] = today_utc
+        print(f'[DB] restored daily state for {today_utc} '
+              f'(loss_streak={daily.get("loss_streak")}, halted={daily.get("halted")})')
+    elif g:
+        print(f'[DB] saved daily was for {g.get("date")}; today is {today_utc} — fresh start')
+
+    # Per-symbol state (cooldowns, streaks)
+    for sym in SYMBOLS:
+        s = db.load_state_symbol(sym)
+        if s:
+            sym_state[sym].update(s)
+    restored_syms = [s for s in SYMBOLS if sym_state[s].get('loss_streak', 0) > 0
+                     or sym_state[s].get('pair_cooldown_until')
+                     or sym_state[s].get('sl_cooldown_until')
+                     or sym_state[s].get('pause_until')]
+    if restored_syms:
+        print(f'[DB] restored sym_state with active flags: {", ".join(restored_syms)}')
+
+
+def reconcile_positions():
+    """Compare DB positions vs live Bitget. Conservative: never auto-trade unknown."""
+    if not db.is_ready():
+        return
+    persisted = db.load_active_positions() or {}
+    try:
+        live = get_all_positions_bitget()
+    except Exception as e:
+        print(f'[RECON] live fetch failed: {e}')
+        live = {}
+
+    # 1. Persisted positions — try to restore those still alive on Bitget
+    for sym, pdata in persisted.items():
+        if sym not in SYMBOLS:
+            continue
+        live_p = live.get(sym)
+        if live_p and live_p['side'] == pdata['side']:
+            # Restore in-memory — bot will resume management via monitor loop
+            for k, v in pdata.items():
+                if k in positions[sym]:
+                    positions[sym][k] = v
+            positions[sym]['active'] = True
+            tg(f'⚡ <b>POSITION RESTORED {sym}</b>\n'
+               f'{pdata["side"].upper()} @ ${pdata["entry"]:,.4f} | SL ${pdata["sl"]:,.4f}\n'
+               f'tp1_hit={pdata["tp1_hit"]} | resuming monitoring')
+            print(f'[RECON] restored {sym} {pdata["side"]} @ {pdata["entry"]}')
+        else:
+            # DB had open, Bitget says no → mark inactive in DB, alert
+            db.clear_position(sym)
+            tg(f'⚠️ <b>RECON {sym}</b>\n'
+               f'DB had open {pdata["side"]} but Bitget shows no/different position. '
+               f'Cleared from DB, no auto-trade.')
+            print(f'[RECON] {sym}: DB had {pdata["side"]}, Bitget=mismatch')
+
+    # 2. Bitget-only positions (bot doesn't know about them) — alert, don't manage
+    unknown = set(live.keys()) - set(persisted.keys())
+    unknown &= set(SYMBOLS)
+    for sym in unknown:
+        tg(f'⚠️ <b>UNMANAGED POSITION {sym}</b>\n'
+           f'Bitget has {live[sym]["side"]} {live[sym]["total"]} but bot has no record. '
+           f'Manual close recommended; bot will not auto-manage it.')
+        print(f'[RECON] unknown live position: {sym} {live[sym]}')
+
+
+# ════════════════════════════════════════════════════════════
 # STARTUP
 # ════════════════════════════════════════════════════════════
 @app.on_event('startup')
 async def startup():
     _sync_time()
+
+    # Phase B — persistence
+    try:
+        db.init_db(DB_PATH)
+        restore_state()
+        reconcile_positions()
+    except Exception as e:
+        print(f'[STARTUP] DB init/restore failed (non-fatal): {e}')
+
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=tg_polling, daemon=True).start()
-    print('[BOT] CrossX Pro Bot v3.1 started —', ', '.join(SYMBOLS))
+    print('[BOT] CrossX Pro Bot v3.4 started —', ', '.join(SYMBOLS))
     tg(
-        '🚀 <b>CrossX Pro Bot v3.1 Online</b>\n'
+        '🚀 <b>CrossX Pro Bot v3.4 Online</b>\n'
         '━━━━━━━━━━━━━━━━━━━\n'
         f'Пары: {" | ".join(SYMBOLS)}\n'
         f'Сессии: Asian + London + NY\n'
-        f'Risk: {int(BASE_RISK_PCT*100)}% base | SL: ATR×{SL_ATR_MULT}\n'
+        f'Risk: {BASE_RISK_PCT*100:.2f}% base | SL: ATR×{SL_ATR_MULT}\n'
         f'TP1: +{TP1_R}R ({int(TP1_SIZE_PCT*100)}%) | TP2: +{TP2_R}R | Lev: {LEVERAGE}x\n'
-        f'Score ≥{MIN_SCORE} | Daily stop: -{int(DAILY_LOSS_LIMIT*100)}%\n'
-        f'Команды: /dashboard — дашборд + советник'
+        f'Score ≥{MIN_SCORE} | Daily stop: -{DAILY_LOSS_LIMIT*100:.0f}%\n'
+        f'Persistence: SQLite ({DB_PATH})\n'
+        f'Команды: /dashboard /report'
     )
 
 
