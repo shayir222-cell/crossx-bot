@@ -6,7 +6,7 @@ Bitget Futures | 5m Timeframe
 import os, json, time, hmac, hashlib, base64, threading
 import requests
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from datetime import datetime, date, timezone, timedelta
 
 import db        # SQLite persistence layer
@@ -1943,6 +1943,50 @@ async def metrics_endpoint():
         'gauges': snap.get('gauges', {}),
         'observations': snap.get('observations', {}),
     }
+
+
+@app.get('/prometheus')
+async def prometheus_endpoint():
+    """Prometheus text exposition format. Public — no token required.
+
+    Counters end in _total. Gauges have HELP/TYPE annotations. Compatible
+    with prometheus.scrape_configs.metrics_path: '/prometheus'.
+    Implementation: stdlib only, no prometheus_client dependency.
+    """
+    snap = metrics.snapshot()
+    lines = []
+
+    # Counters
+    for name, val in sorted(snap.get('counters', {}).items()):
+        full = f'crossx_{name}'
+        lines.append(f'# HELP {full} CrossX counter')
+        lines.append(f'# TYPE {full} counter')
+        lines.append(f'{full} {int(val)}')
+
+    # Gauges
+    for name, val in sorted(snap.get('gauges', {}).items()):
+        full = f'crossx_{name}'
+        lines.append(f'# HELP {full} CrossX gauge')
+        lines.append(f'# TYPE {full} gauge')
+        lines.append(f'{full} {float(val)}')
+
+    # Observations summary (avg/min/max as gauges)
+    for name, stats in sorted(snap.get('observations', {}).items()):
+        for stat_name in ('avg', 'min', 'max'):
+            full = f'crossx_{name}_{stat_name}'
+            lines.append(f'# TYPE {full} gauge')
+            lines.append(f'{full} {float(stats.get(stat_name, 0))}')
+        cnt_full = f'crossx_{name}_count'
+        lines.append(f'# TYPE {cnt_full} gauge')
+        lines.append(f'{cnt_full} {int(stats.get("count", 0))}')
+
+    # Up indicator
+    lines.append('# HELP crossx_up Bot is alive')
+    lines.append('# TYPE crossx_up gauge')
+    lines.append('crossx_up 1')
+
+    body = '\n'.join(lines) + '\n'
+    return Response(content=body, media_type='text/plain; version=0.0.4; charset=utf-8')
 
 
 @app.get('/health')

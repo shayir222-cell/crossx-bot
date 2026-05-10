@@ -1,0 +1,56 @@
+# Prometheus scrape config for CrossX Bot
+# Local testing:
+#   1. Install: docker run -p 9090:9090 -v $(pwd)/infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
+#   2. Open http://localhost:9090
+#   3. Query: crossx_up, crossx_signals_received_total, crossx_orders_submitted_total
+#
+# Production (Render or external host):
+#   - Point your Prometheus instance at the public bot URL via the job below.
+#   - Note: /prometheus endpoint is currently UNAUTHENTICATED to remain
+#     scrape-friendly. If you need to protect it, add a basic_auth/Authorization
+#     header at the scrape config level (Prometheus supports this) and add
+#     auth check in bot.py:prometheus_endpoint.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    project: crossx-bot
+    env: production
+
+scrape_configs:
+  - job_name: 'crossx-bot'
+    metrics_path: '/prometheus'
+    scheme: https
+    static_configs:
+      - targets:
+          - 'crossx-bot.onrender.com'
+        labels:
+          instance: render-prod
+          version: v3.6
+
+  # Optional: scrape /health as a separate up-check
+  - job_name: 'crossx-bot-health'
+    metrics_path: '/health'
+    scheme: https
+    static_configs:
+      - targets:
+          - 'crossx-bot.onrender.com'
+    # /health returns JSON; convert with relabel/json_exporter externally,
+    # or rely on /prometheus crossx_up gauge instead. This block is
+    # documented but disabled by default.
+    scrape_interval: 60s
+
+# Recording rules (optional, generated tier-1 KPIs):
+# Place in a separate file and reference via rule_files.
+# Example KPI: rolling 24h win rate.
+
+# rule_files:
+#   - 'rules/kpi.yml'
+
+# Alertmanager (optional). Use the alerts.py severity layer first.
+
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['localhost:9093']

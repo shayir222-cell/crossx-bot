@@ -1,0 +1,73 @@
+{
+  "title": "CrossX — Risk Monitor",
+  "uid": "crossx-risk",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Halt State",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "increase(crossx_risk_halts_total[24h]) + increase(crossx_daily_dd_halts_total[24h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Loss Streak",
+      "gridPos": { "x": 6, "y": 0, "w": 9, "h": 8 },
+      "targets": [{ "expr": "crossx_current_loss_streak", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Daily DD vs Peak",
+      "gridPos": { "x": 15, "y": 0, "w": 9, "h": 8 },
+      "targets": [
+        { "expr": "crossx_current_drawdown_pct", "legendFormat": "DD %", "refId": "A" },
+        { "expr": "crossx_daily_peak_pnl_pct", "legendFormat": "Peak %", "refId": "B" },
+        { "expr": "crossx_daily_pnl_pct", "legendFormat": "Now %", "refId": "C" }
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Cooldowns / Dedupe (per hour)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_cooldowns_triggered_total[1h]) * 3600", "legendFormat": "cooldown/h", "refId": "A" },
+        { "expr": "rate(crossx_duplicate_signals_blocked_total[1h]) * 3600", "legendFormat": "dedupe/h", "refId": "B" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Trade Outcomes by Reason (rate/h)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_sl_hits_total[1h])*3600", "legendFormat": "SL", "refId": "A" },
+        { "expr": "rate(crossx_tp_hits_total[1h])*3600", "legendFormat": "TP", "refId": "B" },
+        { "expr": "rate(crossx_trail_stops_total[1h])*3600", "legendFormat": "Trail", "refId": "C" },
+        { "expr": "rate(crossx_max_giveback_total[1h])*3600", "legendFormat": "MaxGB", "refId": "D" },
+        { "expr": "rate(crossx_time_stops_total[1h])*3600", "legendFormat": "TimeStop", "refId": "E" }
+      ]
+    }
+  ]
+}

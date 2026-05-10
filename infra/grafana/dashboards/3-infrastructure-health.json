@@ -1,0 +1,54 @@
+{
+  "title": "CrossX — Infrastructure Health",
+  "uid": "crossx-infra",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Bot Up",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_up", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "API Errors (rate/h)",
+      "gridPos": { "x": 4, "y": 0, "w": 10, "h": 8 },
+      "targets": [{ "expr": "rate(crossx_api_errors_total[1h]) * 3600", "refId": "A" }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Close Failures (rate/h)",
+      "gridPos": { "x": 14, "y": 0, "w": 10, "h": 8 },
+      "targets": [{ "expr": "rate(crossx_close_fail_total[1h]) * 3600", "refId": "A" }]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Reconcile Activity",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_reconcile_runs_total[1h]) * 3600", "legendFormat": "runs/h", "refId": "A" },
+        { "expr": "rate(crossx_reconcile_warnings_total[1h]) * 3600", "legendFormat": "warnings/h", "refId": "B" },
+        { "expr": "rate(crossx_reconcile_failures_total[1h]) * 3600", "legendFormat": "failures/h", "refId": "C" },
+        { "expr": "rate(crossx_unmanaged_positions_total[1h]) * 3600", "legendFormat": "unmanaged/h", "refId": "D" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Halt Events (24h cumulative)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "increase(crossx_risk_halts_total[24h])", "legendFormat": "loss-streak halts", "refId": "A" },
+        { "expr": "increase(crossx_daily_dd_halts_total[24h])", "legendFormat": "DD halts", "refId": "B" }
+      ]
+    }
+  ]
+}

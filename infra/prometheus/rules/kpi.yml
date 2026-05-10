@@ -1,0 +1,80 @@
+# Recording rules — derived KPIs for dashboards/alerts.
+# Apply via prometheus.yml rule_files: ['rules/kpi.yml'].
+
+groups:
+  - name: crossx_kpi
+    interval: 60s
+    rules:
+      # Rolling 1h orders submitted
+      - record: crossx:orders_submitted:rate1h
+        expr: rate(crossx_orders_submitted_total[1h])
+
+      # Trade win rate (rolling 24h)
+      - record: crossx:win_rate:24h
+        expr: |
+          (
+            increase(crossx_trades_won_total[24h])
+            /
+            (increase(crossx_trades_won_total[24h]) + increase(crossx_trades_lost_total[24h]))
+          )
+
+      # Signal acceptance ratio (taken / received) over 1h
+      - record: crossx:signal_acceptance:1h
+        expr: |
+          (
+            increase(crossx_signals_taken_total[1h])
+            /
+            (increase(crossx_signals_received_total[1h]) > 0)
+          )
+
+      # Close-failure rate (operational health)
+      - record: crossx:close_fail_rate:1h
+        expr: |
+          increase(crossx_close_fail_total[1h])
+          /
+          (increase(crossx_trades_closed_total[1h]) > 0)
+
+  - name: crossx_alerts
+    rules:
+      # Bot down
+      - alert: CrossxDown
+        expr: crossx_up == 0 or absent(crossx_up)
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: 'CrossX bot is unreachable'
+          description: 'Prometheus has not scraped /prometheus successfully for 2+ minutes.'
+
+      # Risk halt
+      - alert: CrossxRiskHalt
+        expr: increase(crossx_risk_halts_total[5m]) > 0 or increase(crossx_daily_dd_halts_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: 'Trading halted'
+          description: 'Loss-streak halt or daily DD halt triggered.'
+
+      # Excessive close failures
+      - alert: CrossxCloseFailureBurst
+        expr: increase(crossx_close_fail_total[10m]) >= 3
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: '3+ close failures in 10 minutes'
+          description: 'Bitget close API likely rate-limited or down. Investigate manually.'
+
+      # Latency degradation
+      - alert: CrossxHighLatency
+        expr: crossx_avg_execution_latency_ms > 3000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: 'High execution latency'
+          description: 'avg_execution_latency_ms > 3s for 5+ minutes.'
+
+      # Unmanaged position
+      - alert: CrossxUnmanagedPosition
+        expr: increase(crossx_unmanaged_positions_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: 'Unmanaged position on Bitget'
+          description: 'Reconcile detected position on Bitget that bot has no record of.'

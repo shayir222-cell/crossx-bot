@@ -1,0 +1,110 @@
+{
+  "title": "CrossX — Trading Overview",
+  "uid": "crossx-trading",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Bot Up",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_up", "refId": "A" }],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Active Positions",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_active_positions", "refId": "A" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Daily PnL %",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_daily_pnl_pct", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Loss Streak",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_current_loss_streak", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5, "type": "stat", "title": "Drawdown %",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "crossx_current_drawdown_pct", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Trades Closed Rate (per hour)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_trades_won_total[1h]) * 3600", "legendFormat": "won/h", "refId": "A" },
+        { "expr": "rate(crossx_trades_lost_total[1h]) * 3600", "legendFormat": "lost/h", "refId": "B" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Signal Funnel (per hour)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_signals_received_total[1h]) * 3600", "legendFormat": "received", "refId": "A" },
+        { "expr": "rate(crossx_signals_taken_total[1h]) * 3600", "legendFormat": "taken", "refId": "B" },
+        { "expr": "rate(crossx_signals_rejected_total[1h]) * 3600", "legendFormat": "rejected", "refId": "C" }
+      ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "Win Rate 24h (rolling)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [{ "expr": "crossx:win_rate:24h", "refId": "A", "legendFormat": "win rate" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "Session PnL %",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "crossx_session_pnl_asian", "legendFormat": "Asian", "refId": "A" },
+        { "expr": "crossx_session_pnl_london", "legendFormat": "London", "refId": "B" },
+        { "expr": "crossx_session_pnl_overlap", "legendFormat": "Overlap", "refId": "C" },
+        { "expr": "crossx_session_pnl_ny", "legendFormat": "NY", "refId": "D" }
+      ]
+    }
+  ]
+}

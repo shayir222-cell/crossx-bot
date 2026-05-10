@@ -1,0 +1,79 @@
+{
+  "title": "CrossX — Execution Diagnostics",
+  "uid": "crossx-exec",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Avg Latency (ms)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "crossx_avg_execution_latency_ms", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1500 },
+              { "color": "red", "value": 3000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Avg Score (taken)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "crossx_avg_signal_score", "refId": "A" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Orders Submitted (24h)",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "increase(crossx_orders_submitted_total[24h])", "refId": "A" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Orders Failed (24h)",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "increase(crossx_orders_failed_total[24h])", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Execution Latency (avg / min / max)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "crossx_execution_latency_ms_avg", "legendFormat": "avg", "refId": "A" },
+        { "expr": "crossx_execution_latency_ms_min", "legendFormat": "min", "refId": "B" },
+        { "expr": "crossx_execution_latency_ms_max", "legendFormat": "max", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Trades Open vs Close (per hour)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_trades_opened_total[1h]) * 3600", "legendFormat": "opened/h", "refId": "A" },
+        { "expr": "rate(crossx_trades_closed_total[1h]) * 3600", "legendFormat": "closed/h", "refId": "B" }
+      ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "Signal Acceptance Ratio (1h rolling)",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
+      "targets": [{ "expr": "crossx:signal_acceptance:1h", "refId": "A", "legendFormat": "accepted/received" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    }
+  ]
+}
