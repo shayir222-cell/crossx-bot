@@ -9,7 +9,9 @@ from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from datetime import datetime, date, timezone, timedelta
 
-import db  # SQLite persistence layer
+import db        # SQLite persistence layer
+import logger    # structured JSON event logger
+import metrics   # in-memory counters/gauges
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -24,6 +26,7 @@ TG_TOKEN      = os.environ.get('TG_TOKEN', '')
 TG_CHAT_ID    = os.environ.get('TG_CHAT_ID', '')
 RENDER_URL    = os.environ.get('RENDER_URL', '')
 DB_PATH       = os.environ.get('DB_PATH', './crossx.db')
+LOG_DIR       = os.environ.get('LOG_DIR', '/var/data/logs' if os.path.exists('/var/data') else './logs')
 
 BASE_URL = 'https://api.bitget.com'
 
@@ -454,6 +457,8 @@ def api_get(path):
         return requests.get(BASE_URL + path, headers=_h('GET', path), timeout=10).json()
     except Exception as e:
         print(f'[API GET] {path}: {e}')
+        metrics.inc('api_errors_total')
+        logger.log_error('api_error', method='GET', path=path, error=str(e)[:120])
         return {}
 
 def api_post(path, body):
@@ -462,6 +467,8 @@ def api_post(path, body):
         return requests.post(BASE_URL + path, headers=_h('POST', path, b), data=b, timeout=10).json()
     except Exception as e:
         print(f'[API POST] {path}: {e}')
+        metrics.inc('api_errors_total')
+        logger.log_error('api_error', method='POST', path=path, error=str(e)[:120])
         return {}
 
 def get_balance():
@@ -531,6 +538,8 @@ def close_position_safe(symbol, hold_side):
         return True, res2
 
     err = ((res2 or res) or {}).get('msg', 'unknown') if isinstance((res2 or res), dict) else 'unknown'
+    metrics.inc('close_fail_total')
+    logger.log_error('close_failed', symbol=symbol, side=hold_side, error=str(err)[:200])
     tg(f'⚠️ <b>CLOSE FAILED {symbol}</b>\n'
        f'side: {hold_side.upper()} | Bitget: {err}\n'
        f'Will retry on next monitor tick (15s).')
@@ -793,8 +802,14 @@ def check_daily_loss(balance):
     if lost >= DAILY_LOSS_LIMIT:
         daily['halted'] = True
         db.save_state_global(daily)  # persist halt flag
+        metrics.inc('daily_dd_halts_total')
+        metrics.gauge('current_drawdown_pct', lost * 100)
+        logger.log_error('daily_dd_halt', loss_pct=round(lost * 100, 2),
+                         equity=round(equity, 2),
+                         start_balance=round(daily['start_balance'], 2))
         tg(f'🛑 <b>DAILY STOP</b>\nLoss: <b>-{lost*100:.1f}%</b>\nEquity: ${equity:.2f}\nStopped until tomorrow.')
         return True
+    metrics.gauge('current_drawdown_pct', max(lost * 100, 0))
     return False
 
 def is_paused(symbol):
@@ -993,6 +1008,18 @@ def record_result(symbol, won, pnl_pct):
     db.save_state_global(daily)
     db.save_state_symbol(symbol, sym_state[symbol])
 
+    # Observability — gauges reflecting fresh state
+    metrics.gauge('current_loss_streak', daily.get('loss_streak', 0))
+    metrics.gauge('current_win_streak', sym_state[symbol].get('win_streak', 0))
+    metrics.gauge('daily_pnl_pct', daily.get('pnl', 0.0))
+    metrics.gauge('daily_peak_pnl_pct', daily.get('peak_pnl', 0.0))
+    metrics.gauge('active_positions', sum(1 for p in positions.values() if p['active']))
+    if daily.get('halted'):
+        metrics.inc('risk_halts_total')
+        logger.log_warning('risk_halt', reason='loss_streak_4',
+                           loss_streak=daily.get('loss_streak'),
+                           pnl_pct=daily.get('pnl'))
+
 
 # ════════════════════════════════════════════════════════════
 # SIGNAL LOGGING (every webhook — taken or filtered)
@@ -1013,6 +1040,30 @@ def log_signal(symbol, action, score, breakdown, status, reason, session=''):
     if len(signals_log) > 500:
         signals_log.pop(0)
     db.save_signal(entry)  # dual-write
+
+    # Observability — counters + structured event
+    metrics.inc('signals_received_total')
+    if status == 'taken':
+        metrics.inc('signals_taken_total')
+        logger.log_event('signal_taken', symbol=symbol, action=action, score=score,
+                         session=session, reason=reason)
+    elif status == 'filtered':
+        metrics.inc('signals_rejected_total')
+        if 'duplicate' in reason.lower():
+            metrics.inc('duplicate_signals_blocked_total')
+            logger.log_event('duplicate_prevented', symbol=symbol, action=action)
+        elif 'cooldown' in reason.lower():
+            metrics.inc('cooldowns_triggered_total')
+            logger.log_event('cooldown_triggered', symbol=symbol, reason=reason)
+        else:
+            logger.log_event('signal_rejected', symbol=symbol, action=action,
+                             score=score, reason=reason, session=session)
+    elif status == 'halted':
+        logger.log_warning('signal_halted', symbol=symbol, reason=reason)
+    elif status == 'paused':
+        logger.log_event('signal_paused', symbol=symbol, reason=reason)
+    elif status == 'skipped':
+        logger.log_event('signal_skipped', symbol=symbol, reason=reason)
 
 
 # ════════════════════════════════════════════════════════════
@@ -1046,6 +1097,36 @@ def log_trade(symbol, exit_price, exit_reason, won, pnl_pct):
         trades_log.pop(0)
     db.save_trade(trade)  # dual-write
     print(f'[TRADE #{trade["id"]}] {symbol} {trade["side"].upper()} | {exit_reason} | PnL:{pnl_pct:+.3f}%')
+
+    # Observability — counters + structured event
+    metrics.inc('trades_closed_total')
+    if won:
+        metrics.inc('trades_won_total')
+    else:
+        metrics.inc('trades_lost_total')
+    reason_l = (exit_reason or '').lower()
+    if reason_l == 'sl':
+        metrics.inc('sl_hits_total')
+        evt = 'sl_hit'
+    elif reason_l == 'trailing stop':
+        metrics.inc('trail_stops_total')
+        evt = 'trailing_stop'
+    elif reason_l == 'max giveback':
+        metrics.inc('max_giveback_total')
+        evt = 'max_giveback'
+    elif reason_l == 'time stop':
+        metrics.inc('time_stops_total')
+        evt = 'time_stop'
+    elif reason_l == 'manual close':
+        metrics.inc('manual_closes_total')
+        evt = 'manual_close'
+    else:
+        evt = 'trade_closed'
+    logger.log_event(evt, symbol=symbol, side=trade['side'],
+                     trade_id=trade['id'], score=trade['score'],
+                     pnl_pct=trade['pnl_pct'], peak_pnl=trade['peak_pnl'],
+                     duration_min=trade['duration_min'], session=trade['session'],
+                     entry=trade['entry'], exit=trade['exit'])
 
 
 # ════════════════════════════════════════════════════════════
@@ -1150,6 +1231,8 @@ def monitor():
                 if not pos['be_set'] and float_r >= 1.0:
                     pos['sl'] = entry
                     pos['be_set'] = True
+                    logger.log_event('be_set', symbol=symbol, side=side, entry=entry,
+                                     float_r=round(float_r, 2))
                     tg(f'⚡ <b>BE {symbol}</b>\n+1.0R → SL → BE ${entry:,.4f}')
 
                 # TP1: close TP1_SIZE_PCT of position, move SL to BE
@@ -1161,6 +1244,10 @@ def monitor():
                         pos['remaining'] -= tp1_size
                         pos['tp1_hit'] = True
                         pos['sl'] = entry
+                        metrics.inc('tp_hits_total')
+                        logger.log_event('tp_hit', target='TP1', symbol=symbol, side=side,
+                                         price=price, size_closed=tp1_size,
+                                         float_r=round(float_r, 2))
                         tg(f'✂️ <b>TP1 {symbol} +{TP1_R}R</b>\nClosed {int(TP1_SIZE_PCT*100)}% at ${price:,.4f}\nSL → BE ${entry:,.4f}')
 
                 # TP2: close TP2_SIZE_PCT of position
@@ -1172,6 +1259,10 @@ def monitor():
                         pos['remaining'] -= tp2_size
                         pos['tp2_hit'] = True
                         remaining_pct = int((1 - TP1_SIZE_PCT) * (1 - TP2_SIZE_PCT) * 100)
+                        metrics.inc('tp_hits_total')
+                        logger.log_event('tp_hit', target='TP2', symbol=symbol, side=side,
+                                         price=price, size_closed=tp2_size,
+                                         float_r=round(float_r, 2))
                         tg(f'✂️ <b>TP2 {symbol} +{TP2_R}R</b>\nClosed {int(TP2_SIZE_PCT*100)}% at ${price:,.4f}\n{remaining_pct}% trailing...')
 
                 # Trailing Stop (after TP1)
@@ -1472,11 +1563,22 @@ async def webhook(request: Request):
 
     if result.get('code') != '00000':
         log_execution(symbol, side, t_signal, time.time(), price, price, 'rejected', str(result)[:120])
+        metrics.inc('orders_failed_total')
+        logger.log_error('order_failed', symbol=symbol, side=side,
+                         error=str(result)[:200], score=score)
         tg(f'❌ Order failed {symbol}: {result}')
         return JSONResponse({'error': result}, status_code=500)
 
     t_entry = time.time()
     log_execution(symbol, side, t_signal, t_entry, price, price, 'success')
+    latency_ms = int((t_entry - t_signal) * 1000)
+    metrics.inc('orders_submitted_total')
+    metrics.inc('trades_opened_total')
+    metrics.add_obs('execution_latency_ms', latency_ms)
+    metrics.gauge('avg_execution_latency_ms', metrics.avg('execution_latency_ms'))
+    logger.log_event('order_submitted', symbol=symbol, side=side, size=size,
+                     entry=price, sl=sl_price, score=score, session=session_name,
+                     latency_ms=latency_ms, risk_pct=round(risk_pct * 100, 2))
 
     # Update state
     now = datetime.now(timezone.utc)
@@ -1745,17 +1847,113 @@ async def daily_report_endpoint():
 
 @app.get('/metrics')
 async def metrics_endpoint():
-    if not metrics_log:
-        return {'count': 0, 'avg_latency_ms': 0, 'avg_slippage_pct': 0}
-    avg_lat  = sum(m['latency_ms']  for m in metrics_log) / len(metrics_log)
-    avg_slip = sum(m['slippage_pct'] for m in metrics_log) / len(metrics_log)
-    rejected = sum(1 for m in metrics_log if m['status'] == 'rejected')
+    """Combined metrics view: legacy execution log + new counters/gauges."""
+    # Legacy execution log (unchanged)
+    if metrics_log:
+        avg_lat  = sum(m['latency_ms']  for m in metrics_log) / len(metrics_log)
+        avg_slip = sum(m['slippage_pct'] for m in metrics_log) / len(metrics_log)
+        rejected = sum(1 for m in metrics_log if m['status'] == 'rejected')
+        legacy = {
+            'count': len(metrics_log),
+            'rejected': rejected,
+            'avg_latency_ms': round(avg_lat, 1),
+            'avg_slippage_pct': round(avg_slip, 4),
+            'last_20': metrics_log[-20:],
+        }
+    else:
+        legacy = {'count': 0, 'avg_latency_ms': 0, 'avg_slippage_pct': 0}
+
+    # New counters/gauges (Phase 1 observability)
+    snap = metrics.snapshot()
     return {
-        'count': len(metrics_log),
-        'rejected': rejected,
-        'avg_latency_ms': round(avg_lat, 1),
-        'avg_slippage_pct': round(avg_slip, 4),
-        'last_20': metrics_log[-20:],
+        'execution': legacy,
+        'counters': snap.get('counters', {}),
+        'gauges': snap.get('gauges', {}),
+        'observations': snap.get('observations', {}),
+    }
+
+
+@app.get('/health')
+async def health_endpoint():
+    """Quick health snapshot — safe for external uptime monitors (no auth required)."""
+    try:
+        bal_ok = (get_balance() or 0) > 0
+    except Exception:
+        bal_ok = False
+    return {
+        'status': 'ok' if (db.is_ready() and logger.is_ready() and bal_ok) else 'degraded',
+        'checks': {
+            'db_ready': db.is_ready(),
+            'logger_ready': logger.is_ready(),
+            'bitget_balance_ok': bal_ok,
+            'halted': bool(daily.get('halted')),
+            'active_positions': sum(1 for p in positions.values() if p['active']),
+            'session': get_session()[0],
+        },
+        'ts': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get('/diagnostics')
+async def diagnostics_endpoint(x_auth_token: str = Header(default='')):
+    """Deep operational diagnostics. Auth-required (leaks runtime state)."""
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+
+    now = datetime.now(timezone.utc)
+    # Session-PnL gauges (computed on-demand from trades_log so always fresh)
+    today_str = now.strftime('%Y-%m-%d')
+    sess_pnl = {'Asian': 0.0, 'London': 0.0, 'London/NY Overlap': 0.0, 'New York': 0.0}
+    for t in trades_log:
+        if t.get('date') == today_str:
+            s = t.get('session', '')
+            if s in sess_pnl:
+                sess_pnl[s] += t.get('pnl_pct', 0)
+    metrics.gauge('session_pnl_asian', sess_pnl['Asian'])
+    metrics.gauge('session_pnl_london', sess_pnl['London'])
+    metrics.gauge('session_pnl_overlap', sess_pnl['London/NY Overlap'])
+    metrics.gauge('session_pnl_ny', sess_pnl['New York'])
+
+    # Avg signal score (taken signals only)
+    taken = [s for s in signals_log if s['status'] == 'taken' and s['score'] > 0]
+    metrics.gauge('avg_signal_score',
+                  (sum(s['score'] for s in taken) / len(taken)) if taken else 0)
+
+    return {
+        'ts': now.isoformat(),
+        'version': 'v3.5',
+        'uptime_check_only': True,
+        'db': {
+            'ready': db.is_ready(),
+            'path': db.db_path(),
+            'counts': db.stats(),
+        },
+        'logger': {
+            'ready': logger.is_ready(),
+            'log_dir': logger.log_dir(),
+        },
+        'state': {
+            'halted': bool(daily.get('halted')),
+            'loss_streak': daily.get('loss_streak', 0),
+            'streak_paused_until': str(daily.get('streak_pause_until')) if daily.get('streak_pause_until') else None,
+            'last_close_time': str(daily.get('last_close_time')) if daily.get('last_close_time') else None,
+            'daily_pnl_pct': daily.get('pnl', 0),
+            'daily_peak_pnl_pct': daily.get('peak_pnl', 0),
+            'daily_trades': daily.get('trades', 0),
+        },
+        'positions_active': sum(1 for p in positions.values() if p['active']),
+        'symbols': {s: {
+            'win_streak': sym_state[s].get('win_streak', 0),
+            'loss_streak': sym_state[s].get('loss_streak', 0),
+            'pair_cooldown_until': str(sym_state[s].get('pair_cooldown_until')) if sym_state[s].get('pair_cooldown_until') else None,
+            'sl_cooldown_until': str(sym_state[s].get('sl_cooldown_until')) if sym_state[s].get('sl_cooldown_until') else None,
+        } for s in SYMBOLS},
+        'session_pnl_today': sess_pnl,
+        'metrics': metrics.snapshot(),
+        'signals_log_size': len(signals_log),
+        'trades_log_size': len(trades_log),
+        'metrics_log_size': len(metrics_log),
+        'dedupe_hash_table_size': len(_signal_dedupe),
     }
 
 @app.get('/')
@@ -1829,12 +2027,20 @@ def reconcile_positions():
     """Compare DB positions vs live Bitget. Conservative: never auto-trade unknown."""
     if not db.is_ready():
         return
+    metrics.inc('reconcile_runs_total')
+    logger.log_event('reconcile_started')
     persisted = db.load_active_positions() or {}
     try:
         live = get_all_positions_bitget()
     except Exception as e:
         print(f'[RECON] live fetch failed: {e}')
+        metrics.inc('reconcile_failures_total')
+        logger.log_error('reconcile_failure', stage='live_fetch', error=str(e)[:200])
         live = {}
+
+    restored_n = 0
+    orphan_n = 0
+    unmanaged_n = 0
 
     # 1. Persisted positions — try to restore those still alive on Bitget
     for sym, pdata in persisted.items():
@@ -1851,22 +2057,39 @@ def reconcile_positions():
                f'{pdata["side"].upper()} @ ${pdata["entry"]:,.4f} | SL ${pdata["sl"]:,.4f}\n'
                f'tp1_hit={pdata["tp1_hit"]} | resuming monitoring')
             print(f'[RECON] restored {sym} {pdata["side"]} @ {pdata["entry"]}')
+            logger.log_event('reconcile_restored', symbol=sym, side=pdata['side'],
+                             entry=pdata['entry'], sl=pdata['sl'],
+                             tp1_hit=pdata['tp1_hit'])
+            restored_n += 1
         else:
             # DB had open, Bitget says no → mark inactive in DB, alert
             db.clear_position(sym)
+            metrics.inc('reconcile_warnings_total')
+            logger.log_warning('reconcile_warning', kind='orphan_in_db', symbol=sym,
+                               side=pdata.get('side'))
             tg(f'⚠️ <b>RECON {sym}</b>\n'
                f'DB had open {pdata["side"]} but Bitget shows no/different position. '
                f'Cleared from DB, no auto-trade.')
             print(f'[RECON] {sym}: DB had {pdata["side"]}, Bitget=mismatch')
+            orphan_n += 1
 
     # 2. Bitget-only positions (bot doesn't know about them) — alert, don't manage
     unknown = set(live.keys()) - set(persisted.keys())
     unknown &= set(SYMBOLS)
     for sym in unknown:
+        metrics.inc('unmanaged_positions_total')
+        metrics.inc('reconcile_warnings_total')
+        logger.log_warning('reconcile_warning', kind='unmanaged_on_exchange',
+                           symbol=sym, side=live[sym]['side'], total=live[sym]['total'])
         tg(f'⚠️ <b>UNMANAGED POSITION {sym}</b>\n'
            f'Bitget has {live[sym]["side"]} {live[sym]["total"]} but bot has no record. '
            f'Manual close recommended; bot will not auto-manage it.')
         print(f'[RECON] unknown live position: {sym} {live[sym]}')
+        unmanaged_n += 1
+
+    logger.log_event('reconcile_completed',
+                     restored=restored_n, orphans=orphan_n, unmanaged=unmanaged_n,
+                     persisted=len(persisted), live=len(live))
 
 
 # ════════════════════════════════════════════════════════════
@@ -1876,6 +2099,16 @@ def reconcile_positions():
 async def startup():
     _sync_time()
 
+    # Observability — structured logging + metrics
+    try:
+        logger.setup_logger(LOG_DIR)
+        metrics.init_canonical()
+        logger.log_event('startup', version='v3.5', symbols=SYMBOLS,
+                         min_score=MIN_SCORE, leverage=LEVERAGE,
+                         db_path=DB_PATH, log_dir=LOG_DIR)
+    except Exception as e:
+        print(f'[STARTUP] observability init failed (non-fatal): {e}')
+
     # Phase B — persistence
     try:
         db.init_db(DB_PATH)
@@ -1883,6 +2116,7 @@ async def startup():
         reconcile_positions()
     except Exception as e:
         print(f'[STARTUP] DB init/restore failed (non-fatal): {e}')
+        logger.log_error('startup_db_failure', error=str(e))
 
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
