@@ -107,6 +107,76 @@ CREATE TABLE IF NOT EXISTS state_symbol (
   sl_cooldown_until   TEXT,
   pair_cooldown_until TEXT
 );
+
+-- ── Analytics tables (Phase 2 observability) ────────────────────
+-- These tables are ADDITIVE. They never alter execution behavior.
+-- Purpose: research/replay infrastructure with rich per-event context.
+
+CREATE TABLE IF NOT EXISTS analytics_signals (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_utc             TEXT,
+  symbol             TEXT,
+  side               TEXT,
+  action             TEXT,
+  status             TEXT,
+  reason             TEXT,
+  session            TEXT,
+  score              INTEGER,
+  breakdown          TEXT,
+  rsi                REAL,
+  atr                REAL,
+  atr_pct            REAL,
+  volatility_state   TEXT,
+  loss_streak        INTEGER,
+  win_streak         INTEGER,
+  pair_cooldown_left INTEGER,
+  global_cooldown_on INTEGER,
+  hour_count         INTEGER,
+  session_count      INTEGER,
+  daily_pnl_pct      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_asignals_ts ON analytics_signals(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_asignals_symbol ON analytics_signals(symbol);
+
+CREATE TABLE IF NOT EXISTS analytics_trades (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  trade_id           INTEGER,
+  ts_open_utc        TEXT,
+  ts_close_utc       TEXT,
+  symbol             TEXT,
+  side               TEXT,
+  entry              REAL,
+  exit               REAL,
+  size               REAL,
+  score              INTEGER,
+  session            TEXT,
+  atr                REAL,
+  sl                 REAL,
+  tp1_hit            INTEGER,
+  tp2_hit            INTEGER,
+  be_set             INTEGER,
+  peak_pnl_pct       REAL,
+  pnl_pct            REAL,
+  won                INTEGER,
+  exit_reason        TEXT,
+  duration_min       INTEGER,
+  execution_latency_ms INTEGER,
+  loss_streak_at_open  INTEGER,
+  daily_pnl_at_open    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_atrades_symbol ON analytics_trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_atrades_close ON analytics_trades(ts_close_utc);
+
+CREATE TABLE IF NOT EXISTS analytics_alerts (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_utc    TEXT,
+  severity  TEXT,
+  msg       TEXT,
+  symbol    TEXT,
+  action    TEXT,
+  details   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_aalerts_severity ON analytics_alerts(severity);
 """
 
 
@@ -373,11 +443,98 @@ def load_state_symbol(symbol):
     }
 
 
+@_safe(None)
+def save_analytics_signal(s):
+    """Rich analytics row for every signal — separate from execution-critical
+    `signals` table. Never blocks signal processing on failure."""
+    _conn.execute(
+        'INSERT INTO analytics_signals '
+        '(ts_utc,symbol,side,action,status,reason,session,score,breakdown,'
+        ' rsi,atr,atr_pct,volatility_state,loss_streak,win_streak,'
+        ' pair_cooldown_left,global_cooldown_on,hour_count,session_count,daily_pnl_pct) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            datetime.now(timezone.utc).isoformat(),
+            s.get('symbol'), s.get('side'), s.get('action'),
+            s.get('status'), s.get('reason'), s.get('session'),
+            s.get('score'), json.dumps(s.get('breakdown', {})),
+            s.get('rsi'), s.get('atr'), s.get('atr_pct'),
+            s.get('volatility_state'),
+            s.get('loss_streak'), s.get('win_streak'),
+            s.get('pair_cooldown_left'), int(bool(s.get('global_cooldown_on'))),
+            s.get('hour_count'), s.get('session_count'),
+            s.get('daily_pnl_pct'),
+        )
+    )
+
+
+@_safe(None)
+def save_analytics_trade(t):
+    """Rich analytics row at trade close — for replay/backtest infrastructure."""
+    _conn.execute(
+        'INSERT INTO analytics_trades '
+        '(trade_id,ts_open_utc,ts_close_utc,symbol,side,entry,exit,size,score,'
+        ' session,atr,sl,tp1_hit,tp2_hit,be_set,peak_pnl_pct,pnl_pct,won,'
+        ' exit_reason,duration_min,execution_latency_ms,loss_streak_at_open,'
+        ' daily_pnl_at_open) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            t.get('trade_id'),
+            _iso(t.get('ts_open_utc')),
+            _iso(t.get('ts_close_utc')) or datetime.now(timezone.utc).isoformat(),
+            t.get('symbol'), t.get('side'),
+            t.get('entry'), t.get('exit'), t.get('size'), t.get('score'),
+            t.get('session'), t.get('atr'), t.get('sl'),
+            int(bool(t.get('tp1_hit'))), int(bool(t.get('tp2_hit'))),
+            int(bool(t.get('be_set'))),
+            t.get('peak_pnl_pct'), t.get('pnl_pct'), int(bool(t.get('won'))),
+            t.get('exit_reason'), t.get('duration_min'),
+            t.get('execution_latency_ms'),
+            t.get('loss_streak_at_open'),
+            t.get('daily_pnl_at_open'),
+        )
+    )
+
+
+@_safe(None)
+def save_analytics_alert(a):
+    _conn.execute(
+        'INSERT INTO analytics_alerts(ts_utc,severity,msg,symbol,action,details) '
+        'VALUES (?,?,?,?,?,?)',
+        (
+            datetime.now(timezone.utc).isoformat(),
+            a.get('severity'), a.get('msg'), a.get('symbol'),
+            a.get('action'), json.dumps(a.get('details', {})) if a.get('details') else None,
+        )
+    )
+
+
+@_safe(list)
+def load_analytics_trades(limit=200):
+    cur = _conn.execute(
+        'SELECT trade_id,ts_open_utc,ts_close_utc,symbol,side,entry,exit,size,'
+        ' score,session,pnl_pct,won,exit_reason,duration_min,execution_latency_ms '
+        'FROM analytics_trades ORDER BY id DESC LIMIT ?', (limit,))
+    out = []
+    for r in cur.fetchall():
+        out.append({
+            'trade_id': r[0], 'ts_open_utc': r[1], 'ts_close_utc': r[2],
+            'symbol': r[3], 'side': r[4],
+            'entry': r[5], 'exit': r[6], 'size': r[7], 'score': r[8],
+            'session': r[9], 'pnl_pct': r[10], 'won': bool(r[11]),
+            'exit_reason': r[12], 'duration_min': r[13],
+            'execution_latency_ms': r[14],
+        })
+    return list(reversed(out))
+
+
 @_safe(dict)
 def stats():
     cur = _conn.cursor()
     out = {}
-    for tbl in ('trades', 'signals', 'metrics', 'positions', 'state_global', 'state_symbol'):
+    for tbl in ('trades', 'signals', 'metrics', 'positions',
+                'state_global', 'state_symbol',
+                'analytics_signals', 'analytics_trades', 'analytics_alerts'):
         try:
             out[tbl] = cur.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
         except Exception:

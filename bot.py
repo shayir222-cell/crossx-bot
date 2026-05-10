@@ -12,6 +12,7 @@ from datetime import datetime, date, timezone, timedelta
 import db        # SQLite persistence layer
 import logger    # structured JSON event logger
 import metrics   # in-memory counters/gauges
+import alerts    # severity-tagged Telegram wrapper
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -543,6 +544,9 @@ def close_position_safe(symbol, hold_side):
     tg(f'⚠️ <b>CLOSE FAILED {symbol}</b>\n'
        f'side: {hold_side.upper()} | Bitget: {err}\n'
        f'Will retry on next monitor tick (15s).')
+    alerts.critical(f'Close failed for {symbol} {hold_side.upper()}. Position remains open on Bitget.',
+                    symbol=symbol, action=f'close {hold_side}',
+                    details={'error': str(err)[:200], 'retry': 'auto, next 15s tick'})
     log_execution(symbol, hold_side, time.time(), time.time(), 0, 0, 'close_failed', str(err)[:120])
     print(f'[CLOSE FAILED] {symbol} {hold_side} -> {err}')
     return False, res2
@@ -808,6 +812,8 @@ def check_daily_loss(balance):
                          equity=round(equity, 2),
                          start_balance=round(daily['start_balance'], 2))
         tg(f'🛑 <b>DAILY STOP</b>\nLoss: <b>-{lost*100:.1f}%</b>\nEquity: ${equity:.2f}\nStopped until tomorrow.')
+        alerts.fatal(f'Daily DD halt: -{lost*100:.1f}% (equity ${equity:.2f}). Trading stopped until 00:00 UTC.',
+                     action='Review trades; equity auto-resumes next day')
         return True
     metrics.gauge('current_drawdown_pct', max(lost * 100, 0))
     return False
@@ -994,11 +1000,16 @@ def record_result(symbol, won, pnl_pct):
         if gl >= 4:
             daily['halted'] = True
             tg(f'🛑 <b>SESSION HALT</b>\n4 losses in a row — stopped until next day.')
+            alerts.fatal('Session halt — 4 consecutive losses. Trading paused until next day.',
+                         action='Review trades; consider /reset-daily after analysis')
         elif gl == 3:
             daily['streak_pause_until'] = now + timedelta(hours=LOSS_STREAK_PAUSE_H)
             tg(f'⏸ <b>3 LOSSES</b>\nGlobal pause {LOSS_STREAK_PAUSE_H}h.')
+            alerts.warning(f'3 consecutive losses — global pause {LOSS_STREAK_PAUSE_H}h.',
+                           action='Monitor; pause auto-clears')
         elif gl == 2:
             tg(f'⚠️ <b>2 LOSSES</b>\nDefensive mode: risk × 0.5.')
+            alerts.warning('2 consecutive losses — defensive mode active (risk × 0.5).')
 
     # Track peak daily PnL for giveback metric
     if daily['pnl'] > daily.get('peak_pnl', 0.0):
@@ -1065,6 +1076,42 @@ def log_signal(symbol, action, score, breakdown, status, reason, session=''):
     elif status == 'skipped':
         logger.log_event('signal_skipped', symbol=symbol, reason=reason)
 
+    # Analytics dual-write — rich research/replay context
+    try:
+        side_inferred = 'long' if action == 'buy' else ('short' if action == 'sell' else None)
+        st = sym_state.get(symbol, {})
+        pcd = st.get('pair_cooldown_until')
+        pcd_left = 0
+        if pcd:
+            pcd_left = max(0, int((pcd - datetime.now(timezone.utc)).total_seconds() // 60))
+        gc_active, _ = is_global_cooldown_active()
+        # hour/session counts (approximate from in-memory log)
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime('%Y-%m-%d')
+        hour_count = sum(
+            1 for s in signals_log if s['status'] == 'taken'
+            and (now_utc - datetime.strptime(f"{s['date']} {s['time']}",
+                                             '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
+                 ).total_seconds() < 3600
+        )
+        sess_count = sum(
+            1 for s in signals_log if s['status'] == 'taken'
+            and s['date'] == today_str and s.get('session') == session
+        )
+        db.save_analytics_signal({
+            'symbol': symbol, 'side': side_inferred, 'action': action,
+            'status': status, 'reason': reason, 'session': session,
+            'score': score, 'breakdown': breakdown,
+            'loss_streak': daily.get('loss_streak', 0),
+            'win_streak': st.get('win_streak', 0),
+            'pair_cooldown_left': pcd_left,
+            'global_cooldown_on': gc_active,
+            'hour_count': hour_count, 'session_count': sess_count,
+            'daily_pnl_pct': daily.get('pnl', 0.0),
+        })
+    except Exception:
+        pass  # analytics never blocks signals
+
 
 # ════════════════════════════════════════════════════════════
 # TRADE LOGGING
@@ -1127,6 +1174,28 @@ def log_trade(symbol, exit_price, exit_reason, won, pnl_pct):
                      pnl_pct=trade['pnl_pct'], peak_pnl=trade['peak_pnl'],
                      duration_min=trade['duration_min'], session=trade['session'],
                      entry=trade['entry'], exit=trade['exit'])
+
+    # Analytics dual-write — rich post-trade row for replay/backtest
+    try:
+        db.save_analytics_trade({
+            'trade_id': trade['id'],
+            'ts_open_utc': pos.get('entry_time'),
+            'ts_close_utc': datetime.now(timezone.utc),
+            'symbol': symbol, 'side': trade['side'],
+            'entry': trade['entry'], 'exit': trade['exit'], 'size': trade['size'],
+            'score': trade['score'], 'session': trade['session'],
+            'atr': trade['atr'], 'sl': trade['sl'],
+            'tp1_hit': trade['tp1_hit'], 'tp2_hit': trade['tp2_hit'],
+            'be_set': pos.get('be_set', False),
+            'peak_pnl_pct': trade['peak_pnl'], 'pnl_pct': trade['pnl_pct'],
+            'won': won, 'exit_reason': exit_reason,
+            'duration_min': trade['duration_min'],
+            'execution_latency_ms': None,  # not tracked per-trade in current architecture
+            'loss_streak_at_open': None,   # snapshot would require open-time capture
+            'daily_pnl_at_open': None,
+        })
+    except Exception:
+        pass
 
 
 # ════════════════════════════════════════════════════════════
@@ -1567,6 +1636,9 @@ async def webhook(request: Request):
         logger.log_error('order_failed', symbol=symbol, side=side,
                          error=str(result)[:200], score=score)
         tg(f'❌ Order failed {symbol}: {result}')
+        alerts.critical(f'Order failed: Bitget rejected {side} {symbol}',
+                        symbol=symbol, action=side,
+                        details={'error': str(result)[:200]})
         return JSONResponse({'error': result}, status_code=500)
 
     t_entry = time.time()
@@ -2070,6 +2142,8 @@ def reconcile_positions():
             tg(f'⚠️ <b>RECON {sym}</b>\n'
                f'DB had open {pdata["side"]} but Bitget shows no/different position. '
                f'Cleared from DB, no auto-trade.')
+            alerts.warning(f'Reconcile: DB orphan cleared for {sym} (no Bitget position).',
+                           symbol=sym, action=f'cleared {pdata["side"]}')
             print(f'[RECON] {sym}: DB had {pdata["side"]}, Bitget=mismatch')
             orphan_n += 1
 
@@ -2084,6 +2158,9 @@ def reconcile_positions():
         tg(f'⚠️ <b>UNMANAGED POSITION {sym}</b>\n'
            f'Bitget has {live[sym]["side"]} {live[sym]["total"]} but bot has no record. '
            f'Manual close recommended; bot will not auto-manage it.')
+        alerts.critical(f'Unmanaged position on Bitget: {sym} {live[sym]["side"]} (size {live[sym]["total"]}).',
+                        symbol=sym, action='manual close required',
+                        details={'side': live[sym]['side'], 'total': live[sym]['total']})
         print(f'[RECON] unknown live position: {sym} {live[sym]}')
         unmanaged_n += 1
 
@@ -2099,13 +2176,16 @@ def reconcile_positions():
 async def startup():
     _sync_time()
 
-    # Observability — structured logging + metrics
+    # Observability — structured logging + metrics + severity alerts
     try:
         logger.setup_logger(LOG_DIR)
         metrics.init_canonical()
-        logger.log_event('startup', version='v3.5', symbols=SYMBOLS,
+        alerts.bind_sender(tg)
+        alerts.bind_persist(db.save_analytics_alert)
+        logger.log_event('startup', version='v3.6', symbols=SYMBOLS,
                          min_score=MIN_SCORE, leverage=LEVERAGE,
-                         db_path=DB_PATH, log_dir=LOG_DIR)
+                         db_path=DB_PATH, log_dir=LOG_DIR,
+                         tg_min_severity=alerts.get_min_severity())
     except Exception as e:
         print(f'[STARTUP] observability init failed (non-fatal): {e}')
 
