@@ -13,6 +13,7 @@ import db        # SQLite persistence layer
 import logger    # structured JSON event logger
 import metrics   # in-memory counters/gauges
 import alerts    # severity-tagged Telegram wrapper
+import stability_audit  # readiness scoring engine
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -1999,6 +2000,55 @@ async def db_stats_endpoint(x_auth_token: str = Header(default='')):
     return {'db_path': db.db_path(), 'ready': db.is_ready(), 'counts': db.stats()}
 
 
+@app.get('/audit')
+async def audit_endpoint(x_auth_token: str = Header(default='')):
+    """Run the stability audit on-demand. Auth-required (operational state)."""
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    try:
+        result = stability_audit.run_audit(metrics, db)
+        return result
+    except Exception as e:
+        logger.log_error('audit_failure', error=str(e)[:200])
+        return JSONResponse({'error': 'audit failed', 'detail': str(e)[:200]}, status_code=500)
+
+
+@app.get('/soak-report')
+async def soak_report_endpoint(x_auth_token: str = Header(default=''),
+                                limit: int = 10):
+    """Recent soak report rows. Auth-required."""
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    try:
+        cur = db._conn.execute(
+            'SELECT ts_utc, duration_min, webhook_uptime_pct, metrics_uptime_pct, '
+            ' diagnostics_uptime_pct, prometheus_uptime_pct, signals_growth, '
+            ' analytics_signals_growth, analytics_trades_growth, '
+            ' reconcile_runs_observed, event_continuity_score, '
+            ' observability_integrity_score, anomalies '
+            'FROM analytics_soak_reports ORDER BY id DESC LIMIT ?',
+            (max(1, min(int(limit), 100)),)
+        )
+        cols = [d[0] for d in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            try:
+                row['anomalies'] = json.loads(row['anomalies']) if row.get('anomalies') else []
+            except Exception:
+                row['anomalies'] = []
+            rows.append(row)
+        from soak.report import summarize_recent
+        return {
+            'count': len(rows),
+            'summary': summarize_recent(rows),
+            'rows': rows,
+        }
+    except Exception as e:
+        logger.log_error('soak_report_failure', error=str(e)[:200])
+        return JSONResponse({'error': 'soak report failed', 'detail': str(e)[:200]}, status_code=500)
+
+
 @app.get('/daily-report')
 async def daily_report_endpoint():
     return {'report_text': build_daily_report()}
@@ -2338,6 +2388,20 @@ async def startup():
     except Exception as e:
         print(f'[STARTUP] DB init/restore failed (non-fatal): {e}')
         logger.log_error('startup_db_failure', error=str(e))
+
+    # P1 v3.7 — soak validator (optional, off by default)
+    if ENABLE_SOAK_VALIDATION:
+        try:
+            from soak.config import SoakConfig
+            from soak.validator import SoakValidator, http_probe_default
+            cfg = SoakConfig()
+            validator = SoakValidator(cfg, db_module=db, alerts_module=alerts,
+                                       http_probe_fn=http_probe_default)
+            validator.start()
+            logger.log_event('soak_validator_started', config=cfg.to_dict())
+        except Exception as e:
+            print(f'[STARTUP] soak validator failed to start (non-fatal): {e}')
+            logger.log_error('startup_soak_failure', error=str(e))
 
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
