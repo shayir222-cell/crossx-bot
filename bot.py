@@ -24,26 +24,25 @@ RENDER_URL    = os.environ.get('RENDER_URL', '')
 
 BASE_URL = 'https://api.bitget.com'
 
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT']
 
 # ─── Min ATR % per symbol (filters "sleeping" markets) ───
 MIN_ATR_PCT = {
     'BTCUSDT': 0.00080,  # 0.08% → ~$62 min ATR at $78k (fee-efficient at 7x)
     'ETHUSDT': 0.00090,  # 0.09% → ~$3.4 min ATR at $3800
     'BNBUSDT': 0.00120,  # 0.12% → ~$0.74 min ATR at $615
-    'SOLUSDT': 0.00130,  # 0.13% → ~$0.20 min ATR at $155
     'XRPUSDT': 0.00150,  # 0.15% → ~$0.003 min ATR at $2.3
 }
 
 # ─── Risk ────────────────────────────────────────────────
-BASE_RISK_PCT    = 0.0075  # 1.0%→0.75%: SL wider so dollar risk stays ~same
-HIGH_VOL_RISK    = 0.004
-STREAK_RISK      = 0.01
+BASE_RISK_PCT    = 0.0050  # сниженный риск на базовых сделках
+HIGH_VOL_RISK    = 0.0030  # более осторожный риск в высокую волатильность
+STREAK_RISK      = 0.0075  # уменьшенный риск на сильных сигналах
 LEVERAGE         = 7     # 10→7: reduces notional 30% → fees 30% lower
 DAILY_LOSS_LIMIT = 0.10
 
 # ─── ATR levels ──────────────────────────────────────────
-SL_ATR_MULT    = 2.0   # 1.5→2.0: wider SL avoids false stops
+SL_ATR_MULT    = 2.5   # увеличение стопа для снижения количества ложных SL
 TP1_R          = 2.5   # unchanged: first TP at 2.5R
 TP2_R          = 5.0   # unchanged: let full winners run
 TRAIL_ATR_MULT = 1.0   # 1.5→1.0: tighter trail after TP1 captures more peak
@@ -52,7 +51,7 @@ TP1_SIZE_PCT   = 0.50  # 0.40→0.50: lock in half at first TP
 TP2_SIZE_PCT   = 0.50  # 0.30→0.50: close full remainder at TP2
 
 # ─── Score ───────────────────────────────────────────────
-MIN_SCORE = 80  # 82→80: more trades for data accumulation
+MIN_SCORE = 92  # повышенный порог качества сигналов
 
 # ─── Sessions (UTC hours) ────────────────────────────────
 LONDON_OPEN  = 7
@@ -68,12 +67,20 @@ SL_COOLDOWN = 15  # minutes cooldown after any SL hit
 # ─── Correlation groups (don't open same-direction in same group) ─
 CORR_GROUPS = [
     {'BTCUSDT', 'ETHUSDT'},        # ~0.85 correlation
-    {'SOLUSDT', 'BNBUSDT'},        # altcoin group
+    {'BNBUSDT', 'XRPUSDT'},        # altcoin group
 ]
 
 # ─── Time stop ───────────────────────────────────────────
 TIME_STOP_MIN  = 90   # 30→90: give trades time to develop
 TIME_STOP_MOVE = 0.003
+
+# ─── Cooldowns & Trade Limits (incremental safety patch) ──
+GLOBAL_COOLDOWN_MIN = 10   # min between any closed trade and next entry
+PAIR_COOLDOWN_MIN   = 15   # min between trades on the same symbol (any outcome)
+MAX_TRADES_HOUR     = 2
+MAX_TRADES_SESSION  = 5
+DEDUPE_TTL_SEC      = 320  # webhook dedupe hash TTL (>5m bucket so retries inside same candle are deduped)
+LOSS_STREAK_PAUSE_H = 1    # global pause hours after 3rd loss
 
 
 # ════════════════════════════════════════════════════════════
@@ -92,16 +99,22 @@ def _make_pos():
     }
 
 def _make_sym():
-    return {'win_streak': 0, 'loss_streak': 0, 'pause_until': None, 'sl_cooldown_until': None}
+    return {'win_streak': 0, 'loss_streak': 0,
+            'pause_until': None, 'sl_cooldown_until': None,
+            'pair_cooldown_until': None}
 
 positions   = {s: _make_pos() for s in SYMBOLS}
 sym_state   = {s: _make_sym() for s in SYMBOLS}
 trades_log  = []
 signals_log = []  # every incoming webhook: taken or filtered, with full reason
+metrics_log = []  # execution latency / slippage / rejection log
+_signal_dedupe = {}  # hash -> expiry epoch (anti-duplicate webhook)
 
 daily = {
     'date': '', 'start_balance': None, 'halted': False,
     'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0,
+    'loss_streak': 0, 'streak_pause_until': None,
+    'last_close_time': None, 'peak_pnl': 0.0,
 }
 
 
@@ -193,7 +206,7 @@ def send_dashboard(chat_id=None):
         return
 
     bal = get_balance()
-    today = str(date.today())
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     today_trades = [t for t in trades_log if t.get('date') == today]
     today_wins   = sum(1 for t in today_trades if t['won'])
     today_losses = len(today_trades) - today_wins
@@ -231,6 +244,139 @@ def send_dashboard(chat_id=None):
     )
     tg_to(target, text)
 
+
+# ════════════════════════════════════════════════════════════
+# DAILY REPORT (Telegram fix — full prop-style EOD)
+# ════════════════════════════════════════════════════════════
+def build_daily_report():
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today_trades = [t for t in trades_log if t.get('date') == today]
+    cur_session, _ = get_session()
+
+    starting = daily.get('start_balance') or 0.0
+    balance  = get_balance() or 0.0
+    ending   = get_equity() or balance
+    net_usd  = (ending - starting) if starting else 0.0
+    net_pct  = (net_usd / starting * 100) if starting else 0.0
+
+    wins   = sum(1 for t in today_trades if t['won'])
+    losses = len(today_trades) - wins
+    wr     = (wins / len(today_trades) * 100) if today_trades else 0
+
+    # R-multiple per trade (from logged sl + entry + pnl_pct)
+    rs = []
+    for t in today_trades:
+        e, sl = t.get('entry', 0), t.get('sl', 0)
+        if not e or not sl:
+            continue
+        r_pct = ((e - sl) / e * 100) if t['side'] == 'long' else ((sl - e) / e * 100)
+        if r_pct > 0:
+            rs.append(t['pnl_pct'] / r_pct)
+    avg_r = (sum(rs) / len(rs)) if rs else 0.0
+
+    best  = max(today_trades, key=lambda t: t['pnl_pct']) if today_trades else None
+    worst = min(today_trades, key=lambda t: t['pnl_pct']) if today_trades else None
+
+    # Bitget USDT-M futures taker fee 0.06% × 2 sides
+    fees_pct = 0.12 * len(today_trades)
+
+    today_metrics = [m for m in metrics_log if m['time'].startswith(today)]
+    slip_pct = (sum(m['slippage_pct'] for m in today_metrics) / len(today_metrics)) if today_metrics else 0.0
+
+    # Intraday equity curve approximation from sequential pnl_pct
+    sorted_today = sorted(today_trades, key=lambda t: t.get('time', ''))
+    cumul, peak_so_far, dd = [], 0.0, 0.0
+    for t in sorted_today:
+        s = (cumul[-1] if cumul else 0.0) + t['pnl_pct']
+        cumul.append(s)
+        if s > peak_so_far:
+            peak_so_far = s
+        gap = peak_so_far - s
+        if gap > dd:
+            dd = gap
+    peak     = max(cumul) if cumul else 0.0
+    last_pt  = cumul[-1] if cumul else 0.0
+    giveback = (peak - last_pt) if peak > 0 else 0.0
+
+    by_sess = {}
+    by_sym  = {}
+    for t in today_trades:
+        s = t.get('session', 'Unknown')
+        by_sess[s] = by_sess.get(s, 0) + 1
+        sym = t['symbol']
+        by_sym[sym] = by_sym.get(sym, 0) + 1
+
+    if daily['halted']:
+        state = 'halted'
+    elif daily.get('loss_streak', 0) >= 2 or daily.get('pnl', 0) >= 5:
+        state = 'defensive'
+    else:
+        state = 'normal'
+
+    risk_mult = 0.5 if daily.get('loss_streak', 0) >= 2 else 1.0
+    open_pos  = sum(1 for p in positions.values() if p['active'])
+    syms_traded = ', '.join(sorted(by_sym.keys())) if by_sym else '—'
+
+    text = (
+        '📊 <b>DAILY REPORT</b>\n'
+        '━━━━━━━━━━━━━━━━━━━\n'
+        f'Date:      {today}\n'
+        f'Session:   {cur_session}\n'
+        f'Symbols:   {syms_traded}\n'
+        '\n'
+        f'Start bal:  ${starting:,.2f}\n'
+        f'End bal:    ${ending:,.2f}\n'
+        f'Net PnL $:  ${net_usd:+,.2f}\n'
+        f'Net PnL %:  {net_pct:+.2f}%\n'
+        '\n'
+        f'Trades:    {len(today_trades)}\n'
+        f'Wins:      {wins}\n'
+        f'Losses:    {losses}\n'
+        f'Winrate:   {wr:.1f}%\n'
+        '\n'
+        f'Avg R:     {avg_r:+.2f}R\n'
+    )
+    if best:
+        text += f'Best:      {best["pnl_pct"]:+.2f}% ({best["symbol"]})\n'
+    if worst:
+        text += f'Worst:     {worst["pnl_pct"]:+.2f}% ({worst["symbol"]})\n'
+    text += (
+        '\n'
+        f'Fees est:  ~{fees_pct:.2f}%\n'
+        f'Slip avg:  ~{slip_pct:.3f}%\n'
+        '\n'
+        f'Max DD:    {dd:.2f}%\n'
+        f'Peak:      {peak:+.2f}%\n'
+        f'Giveback:  {giveback:.2f}%\n'
+        '\n'
+        '<b>By session:</b>\n'
+        f' Asia:    {by_sess.get("Asian", 0)}\n'
+        f' London:  {by_sess.get("London", 0)}\n'
+        f' Overlap: {by_sess.get("London/NY Overlap", 0)}\n'
+        f' NY:      {by_sess.get("New York", 0)}\n'
+        '\n'
+        '<b>By symbol:</b>\n'
+        f' BTC: {by_sym.get("BTCUSDT", 0)}\n'
+        f' ETH: {by_sym.get("ETHUSDT", 0)}\n'
+        f' SOL: {by_sym.get("SOLUSDT", 0)}\n'
+        f' XRP: {by_sym.get("XRPUSDT", 0)}\n'
+        f' BNB: {by_sym.get("BNBUSDT", 0)}\n'
+        '\n'
+        f'State:     {state}\n'
+        f'Risk mult: ×{risk_mult}\n'
+        f'Leverage:  {LEVERAGE}x\n'
+        f'Open pos:  {open_pos}\n'
+    )
+    return text
+
+
+def send_daily_report(chat_id=None):
+    target = chat_id or TG_CHAT_ID
+    if not target:
+        return
+    tg_to(target, build_daily_report())
+
+
 _tg_offset = 0
 _last_eod_date = ''
 
@@ -248,22 +394,25 @@ def tg_polling():
                     continue
                 if text in ('/dashboard', '/d', '/status'):
                     send_dashboard(cid)
+                elif text in ('/report', '/daily'):
+                    tg_to(cid, build_daily_report())
                 elif text == '/start':
                     tg_to(cid,
                         '🤖 <b>CrossX Pro Bot</b>\n\n'
                         'Команды:\n'
                         '/dashboard — дашборд + советник\n'
                         '/d — то же самое (короче)\n'
+                        '/report — детальный дневной отчёт\n'
                     )
         except Exception as e:
             print(f'[TG POLL] {e}')
 
-        # End-of-day summary at 21:05 UTC (after NY close)
+        # End-of-day summary in 23:55-23:59 UTC window (>=55 — robust to restarts/stalls)
         now = datetime.now(timezone.utc)
-        today = str(date.today())
-        if now.hour == 21 and now.minute == 5 and _last_eod_date != today:
+        today = now.strftime('%Y-%m-%d')
+        if now.hour == 23 and now.minute >= 55 and _last_eod_date != today:
             _last_eod_date = today
-            send_dashboard()
+            send_daily_report()
 
         time.sleep(3)
 
@@ -481,10 +630,10 @@ def score_signal(symbol, side, candles_5m, alert_data=None):
     breakdown['current_tf'] = f'{ctf} ({p}/10)'
 
     ob_os_raw = crossx('ob_os')
+    rsi = calc_rsi(candles_5m)
     if ob_os_raw:
         ob_val = ob_os_raw
     else:
-        rsi = calc_rsi(candles_5m)
         if rsi < 35:   ob_val = 'oversold'
         elif rsi > 65: ob_val = 'overbought'
         else:          ob_val = 'neutral'
@@ -492,7 +641,18 @@ def score_signal(symbol, side, candles_5m, alert_data=None):
     ob_pts = 10 if (is_long and ob_val in ('oversold', 'neutral')) or \
                    (not is_long and ob_val in ('overbought', 'neutral')) else 0
     score += ob_pts
-    breakdown['ob_os'] = f'{ob_val} ({ob_pts}/10)'
+
+    # Patch 5 — graduated RSI penalty (anti-overextension, NOT a hard block)
+    penalty = 0
+    if is_long:
+        if rsi >= 78:   penalty = -10
+        elif rsi >= 70: penalty = -5
+    else:
+        if rsi <= 22:   penalty = -10
+        elif rsi <= 30: penalty = -5
+    score += penalty
+
+    breakdown['ob_os'] = f'{ob_val} ({ob_pts}/10) | RSI={rsi:.0f} pen={penalty}'
 
     return score, breakdown
 
@@ -525,8 +685,8 @@ def get_session():
     h = datetime.now(timezone.utc).hour
     in_ld = LONDON_OPEN <= h < LONDON_CLOSE
     in_ny = NY_OPEN <= h < NY_CLOSE
-    if in_ld and in_ny: return 'London/NY Overlap', 1.0
-    elif in_ld:         return 'London', 1.0
+    if in_ld and in_ny: return 'London/NY Overlap', 0.0
+    elif in_ld:         return 'London', 0.0
     elif in_ny:         return 'New York', 1.0
     elif 0 <= h < 7:    return 'Asian', 1.0   # enabled: score+ATR filters protect quality
     else:               return 'Off-session', 0.0  # blocked: 21-00 UTC dead zone
@@ -566,10 +726,12 @@ def check_news():
 # DAILY STATS & RISK ENGINE
 # ════════════════════════════════════════════════════════════
 def reset_daily():
-    today = str(date.today())
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     if daily['date'] != today:
         daily.update(date=today, start_balance=None, halted=False,
-                     trades=0, wins=0, losses=0, pnl=0.0)
+                     trades=0, wins=0, losses=0, pnl=0.0,
+                     loss_streak=0, streak_pause_until=None,
+                     last_close_time=None, peak_pnl=0.0)
         print(f'[DAY] New day: {today}')
 
 def check_daily_loss(balance):
@@ -616,37 +778,163 @@ def is_correlated_blocked(symbol, side):
                 return True, f'Correlated pair {other} already {side}'
     return False, ''
 
+
+# ════════════════════════════════════════════════════════════
+# COOLDOWNS, TRADE LIMITS, ANTI-DUP, EXEC METRICS (safety patch)
+# ════════════════════════════════════════════════════════════
+def is_global_cooldown_active():
+    last = daily.get('last_close_time')
+    if not last:
+        return False, ''
+    elapsed_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
+    if elapsed_min < GLOBAL_COOLDOWN_MIN:
+        return True, f'Global cooldown {GLOBAL_COOLDOWN_MIN - int(elapsed_min)}m left'
+    return False, ''
+
+def is_pair_cooldown_active(symbol):
+    cd = sym_state[symbol].get('pair_cooldown_until')
+    if not cd:
+        return False, ''
+    now = datetime.now(timezone.utc)
+    if now < cd:
+        mins = int((cd - now).total_seconds() / 60) + 1
+        return True, f'Pair cooldown {mins}m left'
+    sym_state[symbol]['pair_cooldown_until'] = None
+    return False, ''
+
+def is_streak_paused():
+    pu = daily.get('streak_pause_until')
+    if not pu:
+        return False, ''
+    now = datetime.now(timezone.utc)
+    if now < pu:
+        mins = int((pu - now).total_seconds() / 60) + 1
+        return True, f'Loss-streak pause {mins}m left'
+    daily['streak_pause_until'] = None
+    return False, ''
+
+def check_trade_limits():
+    """Returns (allowed, reason). Counts only entries (signals_log status='taken')."""
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime('%Y-%m-%d')
+
+    hour_count = 0
+    for s in signals_log:
+        if s['status'] != 'taken':
+            continue
+        try:
+            t = datetime.strptime(f"{s['date']} {s['time']}", '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if (now - t).total_seconds() < 3600:
+            hour_count += 1
+    if hour_count >= MAX_TRADES_HOUR:
+        return False, f'Hour cap reached ({MAX_TRADES_HOUR})'
+
+    cur_session, _ = get_session()
+    sess_count = sum(
+        1 for s in signals_log
+        if s['status'] == 'taken'
+        and s['date'] == today_str
+        and s.get('session') == cur_session
+    )
+    if sess_count >= MAX_TRADES_SESSION:
+        return False, f'Session cap reached ({MAX_TRADES_SESSION} for {cur_session})'
+
+    return True, ''
+
+def candle_open_5m_ts():
+    ts = int(time.time())
+    return ts - (ts % 300)
+
+def is_duplicate_signal(symbol, side):
+    """Hash-based webhook dedupe: symbol + side + 5m candle bucket. TTL ~100s."""
+    now_epoch = time.time()
+    expired = [k for k, exp in _signal_dedupe.items() if exp < now_epoch]
+    for k in expired:
+        _signal_dedupe.pop(k, None)
+    key = f'{symbol}|{side}|5m|{candle_open_5m_ts()}'
+    h = hashlib.md5(key.encode()).hexdigest()
+    if h in _signal_dedupe:
+        return True
+    _signal_dedupe[h] = now_epoch + DEDUPE_TTL_SEC
+    return False
+
+def log_execution(symbol, side, t_signal, t_entry, requested_price, fill_price, status, reason=''):
+    latency_ms = int((t_entry - t_signal) * 1000) if t_signal else 0
+    slippage_pct = abs(fill_price - requested_price) / requested_price * 100 if requested_price else 0.0
+    metrics_log.append({
+        'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': symbol, 'side': side,
+        'latency_ms': latency_ms,
+        'slippage_pct': round(slippage_pct, 4),
+        'requested': requested_price,
+        'filled': fill_price,
+        'status': status,
+        'reason': reason,
+    })
+    if len(metrics_log) > 500:
+        metrics_log.pop(0)
+
 def get_risk_pct(score, atr, price):
     if is_high_volatility(atr, price):
-        return HIGH_VOL_RISK
-    # Scale risk by score quality
-    if score >= 90:
-        return STREAK_RISK      # 1.25%
+        base = HIGH_VOL_RISK
+    elif score >= 90:
+        base = STREAK_RISK
     elif score >= 82:
-        return BASE_RISK_PCT    # 1.0%
+        base = BASE_RISK_PCT
     else:
-        return BASE_RISK_PCT * 0.5  # 0.5% for borderline signals
+        base = BASE_RISK_PCT * 0.5
+
+    # Patch 4 — defensive multiplier on loss-streak (≥2 global losses today)
+    if daily.get('loss_streak', 0) >= 2:
+        base *= 0.5
+    return base
 
 def record_result(symbol, won, pnl_pct):
+    now = datetime.now(timezone.utc)
     daily['trades'] += 1
     daily['pnl'] += pnl_pct
+    daily['last_close_time'] = now  # Patch 1 — global cooldown anchor
+
+    # Patch 2 — pair cooldown after EVERY close (any outcome)
+    sym_state[symbol]['pair_cooldown_until'] = now + timedelta(minutes=PAIR_COOLDOWN_MIN)
+
     st = sym_state[symbol]
     if won:
         daily['wins'] += 1
+        daily['loss_streak'] = 0
         st['win_streak'] += 1
         st['loss_streak'] = 0
     else:
         daily['losses'] += 1
+        daily['loss_streak'] += 1
         st['loss_streak'] += 1
         st['win_streak'] = 0
-        # SL cooldown after every loss
-        st['sl_cooldown_until'] = datetime.now(timezone.utc) + timedelta(minutes=SL_COOLDOWN)
+        st['sl_cooldown_until'] = now + timedelta(minutes=SL_COOLDOWN)
+
+        # Per-symbol streak (existing behaviour, kept)
         if st['loss_streak'] == 2:
-            st['pause_until'] = datetime.now(timezone.utc) + timedelta(minutes=PAUSE_2L)
+            st['pause_until'] = now + timedelta(minutes=PAUSE_2L)
             tg(f'⏸ <b>{symbol}: 2 losses</b> — pausing {PAUSE_2L}min')
         elif st['loss_streak'] >= 3:
-            st['pause_until'] = datetime.now(timezone.utc) + timedelta(minutes=PAUSE_3L)
+            st['pause_until'] = now + timedelta(minutes=PAUSE_3L)
             tg(f'⏸ <b>{symbol}: 3+ losses</b> — pausing {PAUSE_3L}min')
+
+        # Patch 4 — GLOBAL loss-streak escalation
+        gl = daily['loss_streak']
+        if gl >= 4:
+            daily['halted'] = True
+            tg(f'🛑 <b>SESSION HALT</b>\n4 losses in a row — stopped until next day.')
+        elif gl == 3:
+            daily['streak_pause_until'] = now + timedelta(hours=LOSS_STREAK_PAUSE_H)
+            tg(f'⏸ <b>3 LOSSES</b>\nGlobal pause {LOSS_STREAK_PAUSE_H}h.')
+        elif gl == 2:
+            tg(f'⚠️ <b>2 LOSSES</b>\nDefensive mode: risk × 0.5.')
+
+    # Track peak daily PnL for giveback metric
+    if daily['pnl'] > daily.get('peak_pnl', 0.0):
+        daily['peak_pnl'] = daily['pnl']
 
 
 # ════════════════════════════════════════════════════════════
@@ -922,6 +1210,7 @@ async def ping():
 # ════════════════════════════════════════════════════════════
 @app.post('/webhook')
 async def webhook(request: Request):
+    t_signal = time.time()  # Patch 7 — execution metrics anchor
     try:
         data = await request.json()
     except Exception:
@@ -958,12 +1247,20 @@ async def webhook(request: Request):
     if action not in ('buy', 'sell'):
         return JSONResponse({'error': f'unknown action: {action}'})
 
+    # Patch P9 — define `side` BEFORE any check that uses it
+    side = 'long' if action == 'buy' else 'short'
+
+    # Patch 6 — anti-duplicate webhook (hash: symbol+side+5m bucket)
+    if is_duplicate_signal(symbol, side):
+        log_signal(symbol, action, 0, {}, 'filtered', 'Duplicate webhook (dedupe hash)', '')
+        return JSONResponse({'status': 'duplicate', 'reason': 'duplicate hash'})
+
     # Guards
     session_name, _ = get_session()
 
     if daily['halted']:
-        log_signal(symbol, action, 0, {}, 'halted', 'Daily loss limit', session_name)
-        return JSONResponse({'status': 'halted', 'reason': 'Daily loss limit'})
+        log_signal(symbol, action, 0, {}, 'halted', 'Daily loss limit / session halt', session_name)
+        return JSONResponse({'status': 'halted', 'reason': 'Daily loss limit / session halt'})
 
     if is_session_blocked():
         log_signal(symbol, action, 0, {}, 'filtered', f'{session_name} — low liquidity', session_name)
@@ -974,6 +1271,30 @@ async def webhook(request: Request):
         log_signal(symbol, action, 0, {}, 'filtered', 'Asian session — shorts blocked (upward bias)', session_name)
         return JSONResponse({'status': 'filtered', 'reason': 'Asian session — shorts blocked'})
 
+    # Patch 4 — global loss-streak pause (3 losses → 1h)
+    sp_active, sp_reason = is_streak_paused()
+    if sp_active:
+        log_signal(symbol, action, 0, {}, 'paused', sp_reason, session_name)
+        return JSONResponse({'status': 'paused', 'reason': sp_reason})
+
+    # Patch 1 — global cooldown after any closed trade
+    gc_active, gc_reason = is_global_cooldown_active()
+    if gc_active:
+        log_signal(symbol, action, 0, {}, 'filtered', gc_reason, session_name)
+        return JSONResponse({'status': 'cooldown', 'reason': gc_reason})
+
+    # Patch 2 — pair cooldown after every closed trade on the symbol
+    pc_active, pc_reason = is_pair_cooldown_active(symbol)
+    if pc_active:
+        log_signal(symbol, action, 0, {}, 'filtered', pc_reason, session_name)
+        return JSONResponse({'status': 'cooldown', 'reason': pc_reason})
+
+    # Patch 3 — trade limits (per hour & per session)
+    tl_ok, tl_reason = check_trade_limits()
+    if not tl_ok:
+        log_signal(symbol, action, 0, {}, 'filtered', tl_reason, session_name)
+        return JSONResponse({'status': 'filtered', 'reason': tl_reason})
+
     paused, pause_reason = is_paused(symbol)
     if paused:
         log_signal(symbol, action, 0, {}, 'paused', pause_reason, session_name)
@@ -983,7 +1304,6 @@ async def webhook(request: Request):
         log_signal(symbol, action, 0, {}, 'skipped', f'{symbol} position already open', session_name)
         return JSONResponse({'status': 'skipped', 'reason': f'{symbol} position already open'})
 
-    side = 'long' if action == 'buy' else 'short'
     corr_blocked, corr_reason = is_correlated_blocked(symbol, side)
     if corr_blocked:
         log_signal(symbol, action, 0, {}, 'filtered', corr_reason, session_name)
@@ -1072,8 +1392,12 @@ async def webhook(request: Request):
     result = place_order(symbol, 'buy' if side == 'long' else 'sell', size)
 
     if result.get('code') != '00000':
+        log_execution(symbol, side, t_signal, time.time(), price, price, 'rejected', str(result)[:120])
         tg(f'❌ Order failed {symbol}: {result}')
         return JSONResponse({'error': result}, status_code=500)
+
+    t_entry = time.time()
+    log_execution(symbol, side, t_signal, t_entry, price, price, 'success')
 
     # Update state
     now = datetime.now(timezone.utc)
@@ -1234,10 +1558,17 @@ async def status():
         'symbols_state': sym_info,
         'settings': {
             'timeframe': '5m', 'leverage': f'{LEVERAGE}x',
-            'base_risk': '1%', 'high_vol_risk': '0.5%', 'streak_risk': '1.25%',
+            'base_risk': f'{BASE_RISK_PCT*100:.2f}%',
+            'high_vol_risk': f'{HIGH_VOL_RISK*100:.2f}%',
+            'streak_risk': f'{STREAK_RISK*100:.2f}%',
             'min_score': MIN_SCORE, 'sl': f'ATR×{SL_ATR_MULT}',
             'tp1': f'+{TP1_R}R ({int(TP1_SIZE_PCT*100)}%)', 'tp2': f'+{TP2_R}R ({int(TP2_SIZE_PCT*100)}%)',
-            'trail': f'ATR×{TRAIL_ATR_MULT}', 'daily_stop': f'-{DAILY_LOSS_LIMIT*100}%',
+            'trail': f'ATR×{TRAIL_ATR_MULT}', 'daily_stop': f'-{DAILY_LOSS_LIMIT*100:.0f}%',
+            'global_cooldown_min': GLOBAL_COOLDOWN_MIN,
+            'pair_cooldown_min': PAIR_COOLDOWN_MIN,
+            'max_trades_hour': MAX_TRADES_HOUR,
+            'max_trades_session': MAX_TRADES_SESSION,
+            'dedupe_ttl_sec': DEDUPE_TTL_SEC,
         }
     }
 
@@ -1285,9 +1616,33 @@ async def get_signals():
 @app.get('/reset-daily')
 async def reset_daily_endpoint():
     """Reset daily halt/stats — call after midnight or after false halt."""
-    daily.update(date=str(date.today()), start_balance=None, halted=False,
-                 trades=0, wins=0, losses=0, pnl=0.0)
+    daily.update(date=datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                 start_balance=None, halted=False,
+                 trades=0, wins=0, losses=0, pnl=0.0,
+                 loss_streak=0, streak_pause_until=None,
+                 last_close_time=None, peak_pnl=0.0)
     return {'status': 'daily stats reset', 'date': daily['date']}
+
+
+@app.get('/daily-report')
+async def daily_report_endpoint():
+    return {'report_text': build_daily_report()}
+
+
+@app.get('/metrics')
+async def metrics_endpoint():
+    if not metrics_log:
+        return {'count': 0, 'avg_latency_ms': 0, 'avg_slippage_pct': 0}
+    avg_lat  = sum(m['latency_ms']  for m in metrics_log) / len(metrics_log)
+    avg_slip = sum(m['slippage_pct'] for m in metrics_log) / len(metrics_log)
+    rejected = sum(1 for m in metrics_log if m['status'] == 'rejected')
+    return {
+        'count': len(metrics_log),
+        'rejected': rejected,
+        'avg_latency_ms': round(avg_lat, 1),
+        'avg_slippage_pct': round(avg_slip, 4),
+        'last_20': metrics_log[-20:],
+    }
 
 @app.get('/')
 async def home():
