@@ -29,6 +29,22 @@ RENDER_URL    = os.environ.get('RENDER_URL', '')
 DB_PATH       = os.environ.get('DB_PATH', './crossx.db')
 LOG_DIR       = os.environ.get('LOG_DIR', '/var/data/logs' if os.path.exists('/var/data') else './logs')
 
+# ─── P1 v3.7 Stability validation feature flags ──────────────────
+def _flag(name, default):
+    """Parse boolean env var safely."""
+    val = os.environ.get(name, '').strip().lower()
+    if val in ('1', 'true', 'yes', 'on'):
+        return True
+    if val in ('0', 'false', 'no', 'off'):
+        return False
+    return default
+
+ENABLE_SYMBOL_METRICS  = _flag('ENABLE_SYMBOL_METRICS', True)    # per-symbol counters/gauges
+ENABLE_LATENCY_AUDIT   = _flag('ENABLE_LATENCY_AUDIT', True)     # webhook stage timing + DB rows
+ENABLE_SOAK_VALIDATION = _flag('ENABLE_SOAK_VALIDATION', False)  # background soak validator
+ENABLE_FILL_TRACKING   = _flag('ENABLE_FILL_TRACKING', False)    # WebSocket fills (off by default)
+LATENCY_ANOMALY_MS     = int(os.environ.get('LATENCY_ANOMALY_MS', '3000'))
+
 BASE_URL = 'https://api.bitget.com'
 
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT']
@@ -1053,9 +1069,13 @@ def log_signal(symbol, action, score, breakdown, status, reason, session=''):
     db.save_signal(entry)  # dual-write
 
     # Observability — counters + structured event
+    sym_lbl = {'symbol': symbol} if ENABLE_SYMBOL_METRICS else {}
     metrics.inc('signals_received_total')
+    metrics.inc('signals_received_total', **sym_lbl) if sym_lbl else None
     if status == 'taken':
         metrics.inc('signals_taken_total')
+        if sym_lbl:
+            metrics.inc('signals_taken_total', **sym_lbl)
         logger.log_event('signal_taken', symbol=symbol, action=action, score=score,
                          session=session, reason=reason)
     elif status == 'filtered':
@@ -1146,11 +1166,26 @@ def log_trade(symbol, exit_price, exit_reason, won, pnl_pct):
     print(f'[TRADE #{trade["id"]}] {symbol} {trade["side"].upper()} | {exit_reason} | PnL:{pnl_pct:+.3f}%')
 
     # Observability — counters + structured event
+    sym_lbl_t = {'symbol': symbol} if ENABLE_SYMBOL_METRICS else {}
+    sess_lbl_t = {'session': trade.get('session', '')} if ENABLE_SYMBOL_METRICS and trade.get('session') else {}
     metrics.inc('trades_closed_total')
+    if sym_lbl_t:
+        metrics.inc('trades_closed_total', **sym_lbl_t)
     if won:
         metrics.inc('trades_won_total')
+        if sym_lbl_t:
+            metrics.inc('trades_won_total', **sym_lbl_t)
+        if sess_lbl_t:
+            metrics.inc('trades_won_total', **sess_lbl_t)
     else:
         metrics.inc('trades_lost_total')
+        if sym_lbl_t:
+            metrics.inc('trades_lost_total', **sym_lbl_t)
+        if sess_lbl_t:
+            metrics.inc('trades_lost_total', **sess_lbl_t)
+    # PnL gauge per-symbol (last close PnL)
+    if sym_lbl_t:
+        metrics.gauge('last_trade_pnl_pct', trade.get('pnl_pct', 0), **sym_lbl_t)
     reason_l = (exit_reason or '').lower()
     if reason_l == 'sl':
         metrics.inc('sl_hits_total')
@@ -1445,13 +1480,58 @@ async def ping():
 # ════════════════════════════════════════════════════════════
 # WEBHOOK
 # ════════════════════════════════════════════════════════════
+def _profile_webhook(stages, status, symbol=None, side=None, error=None):
+    """Persist + emit webhook latency profile if ENABLE_LATENCY_AUDIT.
+
+    stages = list of (label, t_start, t_end). Failure-isolated."""
+    if not ENABLE_LATENCY_AUDIT:
+        return
+    try:
+        # Convert deltas to ms
+        deltas = {}
+        for label, t0, t1 in stages:
+            deltas[label] = max(0, int((t1 - t0) * 1000))
+        total = sum(deltas.values())
+
+        # Per-stage observations (with optional symbol label)
+        labels = {'symbol': symbol} if (symbol and ENABLE_SYMBOL_METRICS) else {}
+        for stage, ms in deltas.items():
+            metrics.add_obs('webhook_stage_latency_ms', ms, stage=stage, **labels)
+        metrics.add_obs('webhook_total_latency_ms', total, **labels)
+
+        metrics.inc('webhook_requests_total', status=status, **labels)
+        if total > LATENCY_ANOMALY_MS:
+            metrics.inc('webhook_latency_anomalies_total', **labels)
+            logger.log_warning('webhook_latency_anomaly',
+                               total_ms=total, stages=deltas,
+                               symbol=symbol, status=status)
+
+        db.save_analytics_latency({
+            'symbol': symbol, 'side': side, 'status': status,
+            'parse_ms': deltas.get('parse'),
+            'gates_ms': deltas.get('gates'),
+            'scoring_ms': deltas.get('scoring'),
+            'execution_ms': deltas.get('execution'),
+            'total_ms': total,
+            'error': (error[:200] if error else None),
+        })
+    except Exception:
+        pass
+
+
 @app.post('/webhook')
 async def webhook(request: Request):
-    t_signal = time.time()  # Patch 7 — execution metrics anchor
+    t_request_start = time.time()
+    t_signal = t_request_start  # legacy alias
+    _stages = []  # list of (label, t_start, t_end)
     try:
         data = await request.json()
     except Exception:
+        _stages.append(('parse', t_request_start, time.time()))
+        _profile_webhook(_stages, 'invalid_json')
         return JSONResponse({'error': 'invalid JSON'}, status_code=400)
+    t_parse_done = time.time()
+    _stages.append(('parse', t_request_start, t_parse_done))
 
     if data.get('token') != WEBHOOK_TOKEN:
         return JSONResponse({'error': 'unauthorized'}, status_code=401)
@@ -1558,6 +1638,8 @@ async def webhook(request: Request):
         return JSONResponse({'status': 'halted'})
 
     # Candles + ATR
+    _stages.append(('gates', t_parse_done, time.time()))
+    _t_score_start = time.time()
     candles_5m = get_candles(symbol, '5m', 60)
     if not candles_5m:
         return JSONResponse({'error': 'candle error'}, status_code=500)
@@ -1627,6 +1709,8 @@ async def webhook(request: Request):
                f'Entry ${price:.4f} | ATR {atr_pct*100:.3f}% | risk {risk_pct*100:.2f}%', session_name)
 
     # Place order
+    _stages.append(('scoring', _t_score_start, time.time()))
+    _t_exec_start = time.time()
     set_leverage(symbol)
     result = place_order(symbol, 'buy' if side == 'long' else 'sell', size)
 
@@ -1681,6 +1765,9 @@ async def webhook(request: Request):
         f'Session: {session_name} | MTF: {mtf_info}'
     )
     print(f'[ORDER] {symbol} {side.upper()} | score={score} | price={price}')
+
+    _stages.append(('execution', _t_exec_start, time.time()))
+    _profile_webhook(_stages, 'taken', symbol=symbol, side=side)
 
     return JSONResponse({
         'status': f'{symbol} {side} opened',
@@ -1945,40 +2032,50 @@ async def metrics_endpoint():
     }
 
 
+def _prom_labels(labelset_tuple):
+    """Format labelset tuple as Prometheus label syntax: {key="val",key2="val2"}."""
+    if not labelset_tuple:
+        return ''
+    parts = [f'{k}="{str(v).replace(chr(34), chr(39))}"' for k, v in labelset_tuple]
+    return '{' + ','.join(parts) + '}'
+
+
 @app.get('/prometheus')
 async def prometheus_endpoint():
-    """Prometheus text exposition format. Public — no token required.
-
-    Counters end in _total. Gauges have HELP/TYPE annotations. Compatible
-    with prometheus.scrape_configs.metrics_path: '/prometheus'.
-    Implementation: stdlib only, no prometheus_client dependency.
-    """
-    snap = metrics.snapshot()
+    """Prometheus text exposition format with full label support."""
     lines = []
+    seen_types = set()
 
     # Counters
-    for name, val in sorted(snap.get('counters', {}).items()):
+    for name, ls, val in metrics.list_counters():
         full = f'crossx_{name}'
-        lines.append(f'# HELP {full} CrossX counter')
-        lines.append(f'# TYPE {full} counter')
-        lines.append(f'{full} {int(val)}')
+        if name not in seen_types:
+            lines.append(f'# HELP {full} CrossX counter')
+            lines.append(f'# TYPE {full} counter')
+            seen_types.add(name)
+        lines.append(f'{full}{_prom_labels(ls)} {int(val)}')
 
-    # Gauges
-    for name, val in sorted(snap.get('gauges', {}).items()):
+    seen_types.clear()
+    for name, ls, val in metrics.list_gauges():
         full = f'crossx_{name}'
-        lines.append(f'# HELP {full} CrossX gauge')
-        lines.append(f'# TYPE {full} gauge')
-        lines.append(f'{full} {float(val)}')
-
-    # Observations summary (avg/min/max as gauges)
-    for name, stats in sorted(snap.get('observations', {}).items()):
-        for stat_name in ('avg', 'min', 'max'):
-            full = f'crossx_{name}_{stat_name}'
+        if name not in seen_types:
+            lines.append(f'# HELP {full} CrossX gauge')
             lines.append(f'# TYPE {full} gauge')
-            lines.append(f'{full} {float(stats.get(stat_name, 0))}')
-        cnt_full = f'crossx_{name}_count'
-        lines.append(f'# TYPE {cnt_full} gauge')
-        lines.append(f'{cnt_full} {int(stats.get("count", 0))}')
+            seen_types.add(name)
+        lines.append(f'{full}{_prom_labels(ls)} {float(val)}')
+
+    # Observations: emit avg/min/max/p50/p95/p99/count as gauges
+    seen_types.clear()
+    obs_stat_names = ('avg', 'min', 'max', 'p50', 'p95', 'p99', 'count')
+    for name, ls, stats in metrics.list_observations():
+        for sn in obs_stat_names:
+            full = f'crossx_{name}_{sn}'
+            key = (name, sn)
+            if key not in seen_types:
+                lines.append(f'# TYPE {full} gauge')
+                seen_types.add(key)
+            v = stats.get(sn, 0)
+            lines.append(f'{full}{_prom_labels(ls)} {int(v) if sn == "count" else float(v)}')
 
     # Up indicator
     lines.append('# HELP crossx_up Bot is alive')

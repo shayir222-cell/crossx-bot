@@ -1,0 +1,72 @@
+{
+  "title": "CrossX — Per-Symbol Performance",
+  "uid": "crossx-per-symbol",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "symbol",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(crossx_trades_won_total, symbol)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Trades Won (24h)",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 },
+      "targets": [{
+        "expr": "sum by (symbol) (increase(crossx_trades_won_total{symbol=~\"$symbol\"}[24h]))",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Trades Lost (24h)",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 4 },
+      "targets": [{
+        "expr": "sum by (symbol) (increase(crossx_trades_lost_total{symbol=~\"$symbol\"}[24h]))",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Win Rate per Symbol (24h)",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 4 },
+      "targets": [{
+        "expr": "sum by (symbol) (increase(crossx_trades_won_total{symbol=~\"$symbol\"}[24h])) / clamp_min(sum by (symbol) (increase(crossx_trades_won_total{symbol=~\"$symbol\"}[24h]) + increase(crossx_trades_lost_total{symbol=~\"$symbol\"}[24h])), 1)",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Signals Taken Rate by Symbol (per hour)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "rate(crossx_signals_taken_total{symbol=~\"$symbol\"}[1h]) * 3600",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Last Trade PnL % by Symbol",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "crossx_last_trade_pnl_pct{symbol=~\"$symbol\"}",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }]
+    },
+    {
+      "id": 20, "type": "table", "title": "Per-Symbol Cumulative Trades",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "crossx_trades_won_total{symbol=~\"$symbol\"}", "legendFormat": "won {{symbol}}", "refId": "A", "instant": true },
+        { "expr": "crossx_trades_lost_total{symbol=~\"$symbol\"}", "legendFormat": "lost {{symbol}}", "refId": "B", "instant": true },
+        { "expr": "crossx_signals_taken_total{symbol=~\"$symbol\"}", "legendFormat": "signals {{symbol}}", "refId": "C", "instant": true }
+      ]
+    }
+  ]
+}

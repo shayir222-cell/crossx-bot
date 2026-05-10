@@ -1,0 +1,48 @@
+{
+  "title": "CrossX — Latency Distribution & Slippage",
+  "uid": "crossx-latency-dist",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-12h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Webhook Total Latency Spread (avg / P50 / P95 / P99)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "crossx_webhook_total_latency_ms_avg", "legendFormat": "avg", "refId": "A" },
+        { "expr": "crossx_webhook_total_latency_ms_p50", "legendFormat": "p50", "refId": "B" },
+        { "expr": "crossx_webhook_total_latency_ms_p95", "legendFormat": "p95", "refId": "C" },
+        { "expr": "crossx_webhook_total_latency_ms_p99", "legendFormat": "p99", "refId": "D" },
+        { "expr": "crossx_webhook_total_latency_ms_max", "legendFormat": "max", "refId": "E" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Per-Symbol Webhook Latency (P95)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "crossx_webhook_total_latency_ms_p95{symbol=~\".+\"}",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Execution Latency Distribution (avg / P95)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "crossx_execution_latency_ms_avg", "legendFormat": "avg", "refId": "A" },
+        { "expr": "crossx_execution_latency_ms_p95", "legendFormat": "p95", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Slippage % (when ENABLE_FILL_TRACKING)",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_fills_received_total[5m])", "legendFormat": "fills rate", "refId": "A" },
+        { "expr": "rate(crossx_fills_orphaned_total[5m])", "legendFormat": "orphans rate", "refId": "B" }
+      ]
+    }
+  ]
+}

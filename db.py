@@ -177,6 +177,61 @@ CREATE TABLE IF NOT EXISTS analytics_alerts (
   details   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_aalerts_severity ON analytics_alerts(severity);
+
+-- ── P1 v3.7 Stability Validation tables ─────────────────────────
+-- Webhook latency profile (one row per processed webhook)
+CREATE TABLE IF NOT EXISTS analytics_latency (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_utc          TEXT,
+  symbol          TEXT,
+  side            TEXT,
+  status          TEXT,
+  parse_ms        INTEGER,
+  gates_ms        INTEGER,
+  scoring_ms      INTEGER,
+  execution_ms    INTEGER,
+  total_ms        INTEGER,
+  error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alatency_ts ON analytics_latency(ts_utc);
+
+-- Soak test reports (one row per soak validation cycle)
+CREATE TABLE IF NOT EXISTS analytics_soak_reports (
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_utc                   TEXT,
+  duration_min             INTEGER,
+  webhook_uptime_pct       REAL,
+  metrics_uptime_pct       REAL,
+  diagnostics_uptime_pct   REAL,
+  prometheus_uptime_pct    REAL,
+  signals_growth           INTEGER,
+  analytics_signals_growth INTEGER,
+  analytics_trades_growth  INTEGER,
+  reconcile_runs_observed  INTEGER,
+  event_continuity_score   REAL,
+  observability_integrity_score REAL,
+  anomalies                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_asoak_ts ON analytics_soak_reports(ts_utc);
+
+-- Real execution fills (P1 §2 — populated only if ENABLE_FILL_TRACKING)
+CREATE TABLE IF NOT EXISTS analytics_fills (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_utc                TEXT,
+  order_id              TEXT,
+  symbol                TEXT,
+  side                  TEXT,
+  expected_price        REAL,
+  fill_price            REAL,
+  size_filled           REAL,
+  slippage_pct          REAL,
+  fill_latency_ms       INTEGER,
+  ack_latency_ms        INTEGER,
+  reconciled            INTEGER,
+  raw                   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_afills_order ON analytics_fills(order_id);
+CREATE INDEX IF NOT EXISTS idx_afills_ts ON analytics_fills(ts_utc);
 """
 
 
@@ -509,6 +564,67 @@ def save_analytics_alert(a):
     )
 
 
+@_safe(None)
+def save_analytics_latency(row):
+    """One row per processed webhook with stage-by-stage timing."""
+    _conn.execute(
+        'INSERT INTO analytics_latency '
+        '(ts_utc,symbol,side,status,parse_ms,gates_ms,scoring_ms,execution_ms,total_ms,error) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
+        (
+            datetime.now(timezone.utc).isoformat(),
+            row.get('symbol'), row.get('side'), row.get('status'),
+            row.get('parse_ms'), row.get('gates_ms'),
+            row.get('scoring_ms'), row.get('execution_ms'),
+            row.get('total_ms'),
+            row.get('error'),
+        )
+    )
+
+
+@_safe(None)
+def save_analytics_soak(row):
+    _conn.execute(
+        'INSERT INTO analytics_soak_reports '
+        '(ts_utc,duration_min,webhook_uptime_pct,metrics_uptime_pct,'
+        ' diagnostics_uptime_pct,prometheus_uptime_pct,signals_growth,'
+        ' analytics_signals_growth,analytics_trades_growth,reconcile_runs_observed,'
+        ' event_continuity_score,observability_integrity_score,anomalies) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            datetime.now(timezone.utc).isoformat(),
+            row.get('duration_min'),
+            row.get('webhook_uptime_pct'), row.get('metrics_uptime_pct'),
+            row.get('diagnostics_uptime_pct'), row.get('prometheus_uptime_pct'),
+            row.get('signals_growth'),
+            row.get('analytics_signals_growth'), row.get('analytics_trades_growth'),
+            row.get('reconcile_runs_observed'),
+            row.get('event_continuity_score'),
+            row.get('observability_integrity_score'),
+            json.dumps(row.get('anomalies', []))
+        )
+    )
+
+
+@_safe(None)
+def save_analytics_fill(row):
+    _conn.execute(
+        'INSERT INTO analytics_fills '
+        '(ts_utc,order_id,symbol,side,expected_price,fill_price,size_filled,'
+        ' slippage_pct,fill_latency_ms,ack_latency_ms,reconciled,raw) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            datetime.now(timezone.utc).isoformat(),
+            row.get('order_id'), row.get('symbol'), row.get('side'),
+            row.get('expected_price'), row.get('fill_price'),
+            row.get('size_filled'), row.get('slippage_pct'),
+            row.get('fill_latency_ms'), row.get('ack_latency_ms'),
+            int(bool(row.get('reconciled'))),
+            json.dumps(row.get('raw', {})) if row.get('raw') else None,
+        )
+    )
+
+
 @_safe(list)
 def load_analytics_trades(limit=200):
     cur = _conn.execute(
@@ -534,7 +650,8 @@ def stats():
     out = {}
     for tbl in ('trades', 'signals', 'metrics', 'positions',
                 'state_global', 'state_symbol',
-                'analytics_signals', 'analytics_trades', 'analytics_alerts'):
+                'analytics_signals', 'analytics_trades', 'analytics_alerts',
+                'analytics_latency', 'analytics_soak_reports', 'analytics_fills'):
         try:
             out[tbl] = cur.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
         except Exception:

@@ -1,0 +1,74 @@
+{
+  "title": "CrossX — Execution Quality",
+  "uid": "crossx-exec-quality",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Webhook P50 (ms)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "crossx_webhook_total_latency_ms_p50", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Webhook P95 (ms)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "crossx_webhook_total_latency_ms_p95", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 1500 }, { "color": "red", "value": 3000 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Webhook P99 (ms)",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "crossx_webhook_total_latency_ms_p99", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 3000 }, { "color": "red", "value": 5000 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Latency Anomalies (24h)",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "increase(crossx_webhook_latency_anomalies_total[24h])", "refId": "A" }]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Webhook Stage Latency (P95 by stage)",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "crossx_webhook_stage_latency_ms_p95{stage=\"parse\"}", "legendFormat": "parse P95", "refId": "A" },
+        { "expr": "crossx_webhook_stage_latency_ms_p95{stage=\"gates\"}", "legendFormat": "gates P95", "refId": "B" },
+        { "expr": "crossx_webhook_stage_latency_ms_p95{stage=\"scoring\"}", "legendFormat": "scoring P95", "refId": "C" },
+        { "expr": "crossx_webhook_stage_latency_ms_p95{stage=\"execution\"}", "legendFormat": "execution P95", "refId": "D" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Order Submitted vs Failed (per hour)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(crossx_orders_submitted_total[1h]) * 3600", "legendFormat": "submitted/h", "refId": "A" },
+        { "expr": "rate(crossx_orders_failed_total[1h]) * 3600", "legendFormat": "failed/h", "refId": "B" }
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Close Failures by Symbol",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "rate(crossx_close_fail_total{symbol=~\".+\"}[1h]) * 3600",
+        "legendFormat": "{{symbol}}", "refId": "A"
+      }]
+    }
+  ]
+}
