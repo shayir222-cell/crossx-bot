@@ -1536,12 +1536,29 @@ async def webhook(request: Request):
     _stages.append(('parse', t_request_start, t_parse_done))
 
     if data.get('token') != WEBHOOK_TOKEN:
+        # Observability: count + log invisible-auth rejections (Phase C diag)
+        try:
+            metrics.inc('webhook_requests_total', status='unauthorized')
+            logger.log_warning('webhook_unauthorized',
+                               payload_symbol=str(data.get('symbol', ''))[:32],
+                               payload_action=str(data.get('action', ''))[:16],
+                               has_token=bool(data.get('token')))
+        except Exception:
+            pass
         return JSONResponse({'error': 'unauthorized'}, status_code=401)
 
     reset_daily()
 
     symbol = data.get('symbol', 'BTCUSDT').upper().replace('/', '').replace('-', '')
     if symbol not in SYMBOLS:
+        # Observability: count + log unknown-symbol rejections (Phase C diag)
+        try:
+            metrics.inc('webhook_requests_total', status='unknown_symbol')
+            logger.log_warning('webhook_unknown_symbol',
+                               received_symbol=symbol[:32],
+                               allowed=SYMBOLS)
+        except Exception:
+            pass
         return JSONResponse({'error': f'Unknown symbol: {symbol}. Supported: {SYMBOLS}'}, status_code=400)
 
     action = data.get('action', '').lower()
