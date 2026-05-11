@@ -51,8 +51,8 @@ import requests
 # ── Bitget public candle endpoint ─────────────────────────────────────
 BASE_URL = 'https://api.bitget.com'
 
-def fetch_candles_batch(symbol: str, granularity: str, end_ts_ms: int, limit: int = 1000):
-    """Fetch up to `limit` candles ending at end_ts_ms.
+def fetch_candles_batch(symbol: str, granularity: str, end_ts_ms: int, limit: int = 1000, max_retries: int = 3):
+    """Fetch up to `limit` candles ending at end_ts_ms with retry on SSL/network errors.
     Bitget returns ASC order. Each candle: [ts, o, h, l, c, vol, quote_vol]"""
     url = f'{BASE_URL}/api/v2/mix/market/history-candles'
     params = {
@@ -62,14 +62,25 @@ def fetch_candles_batch(symbol: str, granularity: str, end_ts_ms: int, limit: in
         'endTime': str(end_ts_ms),
         'limit': str(limit),
     }
-    r = requests.get(url, params=params, timeout=15)
-    if r.status_code != 200:
-        return None
-    d = r.json()
-    if d.get('code') != '00000':
-        print(f'  [WARN] {symbol} {granularity}: {d.get("msg")}', file=sys.stderr)
-        return None
-    return d.get('data') or []
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code != 200:
+                return None
+            d = r.json()
+            if d.get('code') != '00000':
+                return None
+            return d.get('data') or []
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            if attempt == max_retries - 1:
+                print(f'  [NET-FAIL] {symbol} {granularity}: {e}', file=sys.stderr)
+                return None
+            time.sleep(1.0 * (attempt + 1))  # 1s, 2s, 3s backoff
+        except Exception:
+            return None
+    return None
 
 
 def fetch_candles_range(symbol: str, granularity: str, days: int):
