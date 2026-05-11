@@ -191,6 +191,99 @@ def tf_bias_from_candles(candles):
     return 'neutral'
 
 
+def calc_ema_series(closes, period):
+    """Returns full EMA series, not just last value."""
+    if len(closes) < period:
+        return [sum(closes) / len(closes)] * len(closes)
+    out = []
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for i in range(len(closes)):
+        if i < period:
+            out.append(ema)
+        else:
+            ema = closes[i] * k + ema * (1 - k)
+            out.append(ema)
+    return out
+
+
+def calc_dmi_di(candles, period=14):
+    """Returns (di_plus, di_minus) — current values."""
+    if not candles or len(candles) < period * 2 + 1:
+        return (0.0, 0.0)
+    try:
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        tr, pdm, mdm = [], [], []
+        for i in range(1, len(candles)):
+            h, l, pc = highs[i], lows[i], closes[i-1]
+            tr.append(max(h-l, abs(h-pc), abs(l-pc)))
+            up   = highs[i] - highs[i-1]
+            down = lows[i-1] - lows[i]
+            pdm.append(up   if (up   > down and up   > 0) else 0.0)
+            mdm.append(down if (down > up   and down > 0) else 0.0)
+        def w(values, p):
+            if len(values) < p: return [0.0]
+            out = [sum(values[:p])]
+            for v in values[p:]:
+                out.append(out[-1] - out[-1]/p + v)
+            return out
+        tr_s, pdm_s, mdm_s = w(tr, period), w(pdm, period), w(mdm, period)
+        tr_v = tr_s[-1]
+        if tr_v == 0:
+            return (0.0, 0.0)
+        return (100.0 * pdm_s[-1] / tr_v, 100.0 * mdm_s[-1] / tr_v)
+    except Exception:
+        return (0.0, 0.0)
+
+
+def score_signal_v3(side, candles_5m, candles_1h,
+                     rsi_long=(45, 70), rsi_short=(30, 55),
+                     adx_min=25, vol_mult=1.3, ema_short=20, ema_long=50, ema_macro=200):
+    """v3 Triple Confirmation strategy: returns (100, breakdown) if all conditions
+    met, (0, breakdown) otherwise. Binary trigger, not gradient."""
+    breakdown = {}
+    if not candles_5m or len(candles_5m) < 60 or not candles_1h or len(candles_1h) < ema_macro + 5:
+        return (0, {'reason': 'insufficient_data'})
+
+    closes_5m = [float(c[4]) for c in candles_5m]
+    closes_1h = [float(c[4]) for c in candles_1h]
+    vols_5m   = [float(c[5]) for c in candles_5m]
+    last_5m   = candles_5m[-1]
+    open_p    = float(last_5m[1])
+    close_p   = float(last_5m[4])
+
+    # EMAs
+    ema_s_series = calc_ema_series(closes_5m, ema_short)
+    ema_l_series = calc_ema_series(closes_5m, ema_long)
+    ema_m_series = calc_ema_series(closes_1h, ema_macro)
+    es, el, em = ema_s_series[-1], ema_l_series[-1], ema_m_series[-1]
+
+    # RSI & ADX & DI on 5m
+    rsi = calc_rsi(candles_5m, 14)
+    adx = calc_adx(candles_5m, 14)
+    di_plus, di_minus = calc_dmi_di(candles_5m, 14)
+
+    # Volume confirmation
+    vol_ma = sum(vols_5m[-20:]) / 20 if len(vols_5m) >= 20 else 0
+    vol_strong = (vols_5m[-1] > vol_ma * vol_mult) if vol_ma > 0 else False
+
+    is_long = (side == 'long')
+    body_ok = (close_p > open_p) if is_long else (close_p < open_p)
+    macro_ok = (close_p > em) if is_long else (close_p < em)
+    trend_ok = (close_p > es and es > el) if is_long else (close_p < es and es < el)
+    rsi_lo, rsi_hi = rsi_long if is_long else rsi_short
+    rsi_ok = (rsi_lo <= rsi <= rsi_hi)
+    adx_ok = (adx >= adx_min)
+    di_ok  = (di_plus > di_minus) if is_long else (di_minus > di_plus)
+
+    breakdown.update(macro=macro_ok, trend=trend_ok, rsi=rsi_ok, rsi_val=round(rsi,1),
+                     adx=adx_ok, adx_val=round(adx,1), di=di_ok, vol=vol_strong, body=body_ok)
+    all_pass = macro_ok and trend_ok and rsi_ok and adx_ok and di_ok and vol_strong and body_ok
+    return (100 if all_pass else 0, breakdown)
+
+
 def score_signal(side, candles_5m, candles_15m, candles_1h, candles_4h):
     """Mirror of bot.score_signal — bot uses payload values OR get_tf_bias fallback.
     In backtest we always use the fallback (offline-derived bias)."""
@@ -285,7 +378,7 @@ def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_ba
 
 
 # ── Main backtest loop ────────────────────────────────────────────────
-def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage, adx_min=0.0):
+def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage, adx_min=0.0, strategy='v2'):
     print(f'\n=== {symbol} ===')
     print(f'  Fetching 5m candles ({days}d)...')
     c5  = fetch_candles_range(symbol, '5m',  days)
@@ -342,7 +435,10 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
 
         sides_to_test = ('long',) if (_LONGS_ONLY) else ('long', 'short')
         for side in sides_to_test:
-            score, br = score_signal(side, win5, win15, win1h, win4h)
+            if strategy == 'v3':
+                score, br = score_signal_v3(side, win5, win1h)
+            else:
+                score, br = score_signal(side, win5, win15, win1h, win4h)
             if score < min_score:
                 continue
 
@@ -435,6 +531,8 @@ def main():
                    help='block bars where ADX < this (0 = no filter)')
     p.add_argument('--longs_only', action='store_true',
                    help='only take long entries (backtest shows shorts unprofitable)')
+    p.add_argument('--strategy', type=str, default='v2', choices=['v2', 'v3'],
+                   help='v2 = score-based (current), v3 = triple confirmation Pine')
     args = p.parse_args()
 
     symbols = [args.symbol] if args.symbol else \
@@ -449,10 +547,11 @@ def main():
 
     all_trades = []
     all_summary = []
-    print(f'  adx_min={args.adx_min}  longs_only={args.longs_only}')
+    print(f'  strategy={args.strategy}  adx_min={args.adx_min}  longs_only={args.longs_only}')
     for sym in symbols:
         trades = backtest_symbol(sym, args.days, args.min_score, args.sl_atr, args.tp_r,
-                                  args.fee_pct, args.leverage, adx_min=args.adx_min) or []
+                                  args.fee_pct, args.leverage, adx_min=args.adx_min,
+                                  strategy=args.strategy) or []
         summary = report(sym, trades, args.capital, args.risk_pct)
         if summary:
             all_summary.append(summary)

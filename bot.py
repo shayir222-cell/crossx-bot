@@ -47,19 +47,19 @@ ENABLE_LATENCY_AUDIT   = _flag('ENABLE_LATENCY_AUDIT', True)     # webhook stage
 ENABLE_SOAK_VALIDATION = _flag('ENABLE_SOAK_VALIDATION', False)  # background soak validator
 ENABLE_FILL_TRACKING   = _flag('ENABLE_FILL_TRACKING', False)    # WebSocket fills (off by default)
 ENABLE_FUNDING_FILTER  = _flag('ENABLE_FUNDING_FILTER', False)   # block trades when funding heavily favors opposite side
-ENABLE_REGIME_FILTER   = _flag('ENABLE_REGIME_FILTER', False)    # block trades in ranging markets (ADX < threshold)
+ENABLE_REGIME_FILTER   = _flag('ENABLE_REGIME_FILTER', True)     # ON by default: 30d backtest showed +0.18R improvement
 LATENCY_ANOMALY_MS     = int(os.environ.get('LATENCY_ANOMALY_MS', '3000'))
 FUNDING_THRESHOLD_PCT  = float(os.environ.get('FUNDING_THRESHOLD_PCT', '0.10'))  # block if |funding| > this
 ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))      # block if ADX < this (ranging)
 
 BASE_URL = 'https://api.bitget.com'
 
-# Narrowed to TONUSDT only after 30d backtest showed -0.305R overall expectancy,
-# with TON as the only positive-expectancy symbol (+0.109R, PF=1.16).
-# Other 6 pairs lost between -$24 and -$229 in the simulation. Capital
-# preservation first; broader universe will return after strategy improvements
-# show positive backtest expectancy on multiple symbols.
-SYMBOLS = ['TONUSDT']
+# Selection after ADX≥20 + longs-only backtest (30d):
+#   TONUSDT  +0.465R (PF 1.95, WR 55.1%)
+#   AVAXUSDT +0.167R (PF 1.24, WR 42.7%)
+# Combined estimated portfolio expectancy: +0.326R/trade.
+# Other 5 pairs remained negative even with ADX gate enabled.
+SYMBOLS = ['TONUSDT', 'AVAXUSDT']
 
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
 MIN_ATR_PCT = {
