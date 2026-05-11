@@ -2197,6 +2197,33 @@ async def db_stats_endpoint(x_auth_token: str = Header(default='')):
     return {'db_path': db.db_path(), 'ready': db.is_ready(), 'counts': db.stats()}
 
 
+@app.get('/analyze')
+async def analyze_endpoint(x_auth_token: str = Header(default=''),
+                            since: str = '',
+                            format: str = 'markdown'):
+    """Performance breakdown — per-symbol/side/session/exit-reason stats.
+
+    Query params:
+      since:  '' (all-time) | '24h' | '7d' | '30d' | '2w'
+      format: 'markdown' (default, text/plain) | 'json'
+    Auth: X-Auth-Token header required (operational data).
+    """
+    if not _check_auth(x_auth_token):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    try:
+        import analyze as _analyze
+        report = _analyze.build_report(DB_PATH, since=since, fmt=format)
+        if format == 'json':
+            try:
+                return json.loads(report)
+            except Exception:
+                return JSONResponse({'error': 'json parse', 'raw': report[:500]}, status_code=500)
+        return Response(content=report, media_type='text/plain; charset=utf-8')
+    except Exception as e:
+        logger.log_error('analyze_failure', error=str(e)[:200])
+        return JSONResponse({'error': 'analyze failed', 'detail': str(e)[:200]}, status_code=500)
+
+
 @app.get('/audit')
 async def audit_endpoint(x_auth_token: str = Header(default='')):
     """Run the stability audit on-demand. Auth-required (operational state)."""
