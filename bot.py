@@ -15,6 +15,7 @@ import metrics   # in-memory counters/gauges
 import alerts    # severity-tagged Telegram wrapper
 import stability_audit  # readiness scoring engine
 import funding   # funding rate fetcher (optional filter)
+import backup    # SQLite DB backup daemon
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -48,18 +49,21 @@ ENABLE_SOAK_VALIDATION = _flag('ENABLE_SOAK_VALIDATION', False)  # background so
 ENABLE_FILL_TRACKING   = _flag('ENABLE_FILL_TRACKING', False)    # WebSocket fills (off by default)
 ENABLE_FUNDING_FILTER  = _flag('ENABLE_FUNDING_FILTER', False)   # block trades when funding heavily favors opposite side
 ENABLE_REGIME_FILTER   = _flag('ENABLE_REGIME_FILTER', True)     # ON by default: 30d backtest showed +0.18R improvement
+ENABLE_DB_BACKUP       = _flag('ENABLE_DB_BACKUP', True)         # auto-backup DB every N hours
+DB_BACKUP_INTERVAL_HRS = float(os.environ.get('DB_BACKUP_INTERVAL_HRS', '6'))
+DB_BACKUP_KEEP_LAST    = int(os.environ.get('DB_BACKUP_KEEP_LAST', '7'))
+DB_BACKUP_DIR          = os.environ.get('DB_BACKUP_DIR', '/var/data/backups')
 LATENCY_ANOMALY_MS     = int(os.environ.get('LATENCY_ANOMALY_MS', '3000'))
 FUNDING_THRESHOLD_PCT  = float(os.environ.get('FUNDING_THRESHOLD_PCT', '0.10'))  # block if |funding| > this
 ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))      # block if ADX < this (ranging)
 
 BASE_URL = 'https://api.bitget.com'
 
-# Selection after ADX≥20 + longs-only backtest (30d):
-#   TONUSDT  +0.465R (PF 1.95, WR 55.1%)
-#   AVAXUSDT +0.167R (PF 1.24, WR 42.7%)
-# Combined estimated portfolio expectancy: +0.326R/trade.
-# Other 5 pairs remained negative even with ADX gate enabled.
-SYMBOLS = ['TONUSDT', 'AVAXUSDT']
+# All 7 pairs enabled. Per-pair calibration applied via PAIR_MIN_SCORE and
+# PAIR_TP_R below (data-driven from 30d backtest sweep). ADX gate (default ON)
+# filters ranging markets across all pairs.
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT',
+           'TONUSDT', 'LINKUSDT', 'AVAXUSDT']
 
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
 MIN_ATR_PCT = {
@@ -2584,6 +2588,24 @@ async def startup():
         except Exception as e:
             print(f'[STARTUP] soak validator failed to start (non-fatal): {e}')
             logger.log_error('startup_soak_failure', error=str(e))
+
+    # DB backup daemon — keeps last N snapshots of crossx.db on persistent disk
+    if ENABLE_DB_BACKUP:
+        try:
+            backup.start_backup_daemon(
+                db_path=DB_PATH,
+                backup_dir=DB_BACKUP_DIR,
+                interval_hours=DB_BACKUP_INTERVAL_HRS,
+                keep_last=DB_BACKUP_KEEP_LAST,
+                logger_module=logger,
+            )
+            logger.log_event('backup_daemon_started',
+                             dir=DB_BACKUP_DIR,
+                             interval_hrs=DB_BACKUP_INTERVAL_HRS,
+                             keep_last=DB_BACKUP_KEEP_LAST)
+        except Exception as e:
+            print(f'[STARTUP] backup daemon failed (non-fatal): {e}')
+            logger.log_error('startup_backup_failure', error=str(e))
 
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
