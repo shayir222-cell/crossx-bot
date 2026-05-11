@@ -107,8 +107,8 @@ TIME_STOP_MOVE = 0.003
 # ─── Cooldowns & Trade Limits (incremental safety patch) ──
 GLOBAL_COOLDOWN_MIN = 10   # min between any closed trade and next entry
 PAIR_COOLDOWN_MIN   = 15   # min between trades on the same symbol (any outcome)
-MAX_TRADES_HOUR     = 2
-MAX_TRADES_SESSION  = 5
+MAX_TRADES_HOUR     = 5    # statistics-collection mode (was 2)
+MAX_TRADES_SESSION  = 10   # statistics-collection mode (was 5) — per-session cap
 DEDUPE_TTL_SEC      = 320  # webhook dedupe hash TTL (>5m bucket so retries inside same candle are deduped)
 LOSS_STREAK_PAUSE_H = 1    # global pause hours after 3rd loss
 
