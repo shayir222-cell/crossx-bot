@@ -429,9 +429,11 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
         if idx_15 is None or idx_1h is None or idx_4h is None:
             continue
 
-        win5  = c5[max(0, i-79):i+1]                            # 80 bars 5m
+        # Window sizes: v2 uses 80-bar lookback; v3 needs 210+ on 1H for EMA200.
+        win5  = c5[max(0, i-79):i+1]
         win15 = c15[max(0, idx_15-79):idx_15+1]
-        win1h = c1h[max(0, idx_1h-79):idx_1h+1]
+        win1h_size = 210 if strategy == 'v3' else 79
+        win1h = c1h[max(0, idx_1h-win1h_size):idx_1h+1]
         win4h = c4h[max(0, idx_4h-79):idx_4h+1]
 
         atr = calc_atr(win5, 14)
