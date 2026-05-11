@@ -1,0 +1,88 @@
+//@version=6
+// CrossX Bot v3 — Triple Confirmation
+// =====================================
+// Stricter signal logic vs v2 ATR-Trail crossover. Adds:
+//   - EMA200 macro context (only trade with HTF trend)
+//   - EMA20/EMA50 short-term confirmation
+//   - RSI sweet-spot (not overextended)
+//   - Volume spike confirmation
+//   - Built-in ADX trend-strength filter
+//
+// Goal: produce fewer but higher-quality signals. Strict by design —
+// expect 0.5-2 signals per day per symbol vs 5-10 from v2.
+//
+// Alert messages embedded — paste this into TradingView Pine Editor,
+// Save, Add to chart, create alerts on "CrossX v3 LONG" and "CrossX v3 SHORT"
+// conditions.
+
+indicator("CrossX Bot v3 - Triple Confirmation", overlay=true, shorttitle="CrossX v3")
+
+// ── Inputs ───────────────────────────────────────────────────────────
+emaShortLen = input.int(20,  "EMA Short",                minval=5,  maxval=50)
+emaLongLen  = input.int(50,  "EMA Long",                 minval=20, maxval=200)
+emaMacroLen = input.int(200, "EMA Macro (HTF context)",  minval=50, maxval=400)
+
+adxLen      = input.int(14,   "ADX Length",              minval=5, maxval=30)
+adxMin      = input.float(25, "Min ADX (trend strength)", minval=10, maxval=50, step=1)
+
+rsiLen        = input.int(14,    "RSI Length")
+rsiLongMin    = input.float(45,  "RSI Long Min",    minval=30, maxval=60)
+rsiLongMax    = input.float(70,  "RSI Long Max",    minval=60, maxval=80)
+rsiShortMin   = input.float(30,  "RSI Short Min",   minval=20, maxval=50)
+rsiShortMax   = input.float(55,  "RSI Short Max",   minval=40, maxval=70)
+
+volMult       = input.float(1.3, "Volume Threshold (x avg)", minval=1.0, maxval=3.0, step=0.1)
+volLen        = input.int(20,    "Volume Average Period")
+
+useBodyFilter = input.bool(true, "Require bullish/bearish body")
+
+// ── Indicators ───────────────────────────────────────────────────────
+ema_short = ta.ema(close, emaShortLen)
+ema_long  = ta.ema(close, emaLongLen)
+ema_macro = ta.ema(close, emaMacroLen)
+rsi_val   = ta.rsi(close, rsiLen)
+
+// ADX via DMI built-in
+[diplus, diminus, adx_val] = ta.dmi(adxLen, adxLen)
+
+vol_ma     = ta.sma(volume, volLen)
+vol_strong = volume > vol_ma * volMult
+
+// Body filters
+body_bullish = close > open
+body_bearish = close < open
+
+// ── Long conditions ──────────────────────────────────────────────────
+long_macro  = close > ema_macro                              // above HTF trend filter
+long_trend  = close > ema_short and ema_short > ema_long     // short EMA stack bullish
+long_rsi    = rsi_val >= rsiLongMin and rsi_val <= rsiLongMax
+long_adx    = adx_val >= adxMin
+long_di     = diplus > diminus                                // DI+ dominant
+long_body   = not useBodyFilter or body_bullish
+
+long_signal = long_macro and long_trend and long_rsi and long_adx and long_di and vol_strong and long_body
+
+// ── Short conditions ─────────────────────────────────────────────────
+short_macro = close < ema_macro
+short_trend = close < ema_short and ema_short < ema_long
+short_rsi   = rsi_val >= rsiShortMin and rsi_val <= rsiShortMax
+short_adx   = adx_val >= adxMin
+short_di    = diminus > diplus
+short_body  = not useBodyFilter or body_bearish
+
+short_signal = short_macro and short_trend and short_rsi and short_adx and short_di and vol_strong and short_body
+
+// ── Plotting ─────────────────────────────────────────────────────────
+plot(ema_short, "EMA20",  color=color.new(color.aqua,    0))
+plot(ema_long,  "EMA50",  color=color.new(color.orange,  0))
+plot(ema_macro, "EMA200", color=color.new(color.red,     0), linewidth=2)
+
+plotshape(long_signal,  "LONG",  shape.labelup,   location.belowbar, color.new(color.green, 0), text="LONG",  textcolor=color.white, size=size.small)
+plotshape(short_signal, "SHORT", shape.labeldown, location.abovebar, color.new(color.red,   0), text="SHORT", textcolor=color.white, size=size.small)
+
+bgcolor(long_signal  ? color.new(color.green, 85) : na, title="long bg")
+bgcolor(short_signal ? color.new(color.red,   85) : na, title="short bg")
+
+// ── Alerts (embedded payload) ────────────────────────────────────────
+alertcondition(long_signal,  "CrossX v3 LONG",  '{"token":"crossx_A92kLm7QxP41vR8nTy5Zc","action":"buy","symbol":"{{ticker}}"}')
+alertcondition(short_signal, "CrossX v3 SHORT", '{"token":"crossx_A92kLm7QxP41vR8nTy5Zc","action":"sell","symbol":"{{ticker}}"}')

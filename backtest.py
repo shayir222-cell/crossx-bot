@@ -136,6 +136,47 @@ def calc_rsi(candles, period=14):
         return 100.0
     return 100 - (100 / (1 + ag / al))
 
+
+def calc_adx(candles, period=14):
+    """Wilder ADX (0-100). Mirrors bot.calc_adx logic."""
+    if not candles or len(candles) < (period * 2 + 1):
+        return 0.0
+    try:
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        tr, pdm, mdm = [], [], []
+        for i in range(1, len(candles)):
+            h, l, pc = highs[i], lows[i], closes[i-1]
+            tr.append(max(h-l, abs(h-pc), abs(l-pc)))
+            up   = highs[i] - highs[i-1]
+            down = lows[i-1] - lows[i]
+            pdm.append(up   if (up   > down and up   > 0) else 0.0)
+            mdm.append(down if (down > up   and down > 0) else 0.0)
+        def w(values, p):
+            if len(values) < p: return []
+            out = [sum(values[:p])]
+            for v in values[p:]:
+                out.append(out[-1] - out[-1]/p + v)
+            return out
+        tr_s, pdm_s, mdm_s = w(tr, period), w(pdm, period), w(mdm, period)
+        if not tr_s: return 0.0
+        dx = []
+        for tr_v, pdm_v, mdm_v in zip(tr_s, pdm_s, mdm_s):
+            if tr_v == 0: dx.append(0.0); continue
+            pdi  = 100.0 * pdm_v / tr_v
+            mdi  = 100.0 * mdm_v / tr_v
+            denom = pdi + mdi
+            dx.append(0.0 if denom == 0 else 100.0 * abs(pdi - mdi) / denom)
+        if len(dx) < period:
+            return sum(dx) / max(len(dx), 1)
+        adx = sum(dx[:period]) / period
+        for v in dx[period:]:
+            adx = (adx * (period-1) + v) / period
+        return max(0.0, min(100.0, adx))
+    except Exception:
+        return 0.0
+
 def tf_bias_from_candles(candles):
     """Simplified bias inference from candle set: bullish if last close > EMA50, else bearish."""
     if not candles or len(candles) < 50:
@@ -244,7 +285,7 @@ def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_ba
 
 
 # ── Main backtest loop ────────────────────────────────────────────────
-def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage):
+def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage, adx_min=0.0):
     print(f'\n=== {symbol} ===')
     print(f'  Fetching 5m candles ({days}d)...')
     c5  = fetch_candles_range(symbol, '5m',  days)
@@ -293,7 +334,14 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
         if atr == 0:
             continue
 
-        for side in ('long', 'short'):
+        # ADX regime gate
+        if adx_min > 0:
+            adx_val = calc_adx(win5, 14)
+            if adx_val < adx_min:
+                continue
+
+        sides_to_test = ('long',) if (_LONGS_ONLY) else ('long', 'short')
+        for side in sides_to_test:
             score, br = score_signal(side, win5, win15, win1h, win4h)
             if score < min_score:
                 continue
@@ -383,10 +431,17 @@ def main():
     p.add_argument('--leverage', type=int, default=7)
     p.add_argument('--capital', type=float, default=152.60)
     p.add_argument('--risk_pct', type=float, default=0.005)
+    p.add_argument('--adx_min', type=float, default=0.0,
+                   help='block bars where ADX < this (0 = no filter)')
+    p.add_argument('--longs_only', action='store_true',
+                   help='only take long entries (backtest shows shorts unprofitable)')
     args = p.parse_args()
 
     symbols = [args.symbol] if args.symbol else \
               ['BTCUSDT','ETHUSDT','BNBUSDT','XRPUSDT','TONUSDT','LINKUSDT','AVAXUSDT']
+
+    global _LONGS_ONLY
+    _LONGS_ONLY = args.longs_only
 
     print(f'Backtest config: {args.days}d  MIN_SCORE={args.min_score}  '
           f'SL=ATRx{args.sl_atr}  TP={args.tp_r}R  fee={args.fee_pct}%/side  '
@@ -394,9 +449,10 @@ def main():
 
     all_trades = []
     all_summary = []
+    print(f'  adx_min={args.adx_min}  longs_only={args.longs_only}')
     for sym in symbols:
         trades = backtest_symbol(sym, args.days, args.min_score, args.sl_atr, args.tp_r,
-                                  args.fee_pct, args.leverage) or []
+                                  args.fee_pct, args.leverage, adx_min=args.adx_min) or []
         summary = report(sym, trades, args.capital, args.risk_pct)
         if summary:
             all_summary.append(summary)

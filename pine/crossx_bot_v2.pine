@@ -1,0 +1,34 @@
+//@version=6
+// CrossX Bot v2 — ATR Trailing Crossover (LEGACY)
+// =================================================
+// This is the v2 strategy currently in TradingView alerts.
+// 30-day backtest showed -0.305R overall expectancy.
+// Only TONUSDT was profitable (+0.109R, PF=1.16).
+//
+// Kept here for reference. v3 (Triple Confirmation) is the newer
+// candidate with stricter entry criteria.
+
+indicator("CrossX Bot v2", overlay=true, shorttitle="CrossX v2")
+
+atr_mult = input.float(1.0, "ATR Multiplier", minval=0.1, step=0.1)
+atr_len  = input.int(10, "ATR Length")
+
+src  = close
+atr  = ta.atr(atr_len)
+nLoss = atr_mult * atr
+
+var float trail = na
+trail := na(trail[1]) ? src :
+         src > trail[1] and src[1] > trail[1] ? math.max(trail[1], src - nLoss) :
+         src < trail[1] and src[1] < trail[1] ? math.min(trail[1], src + nLoss) :
+         src > trail[1] ? src - nLoss : src + nLoss
+
+buy  = ta.crossover(src, trail)
+sell = ta.crossunder(src, trail)
+
+plot(trail, "Trail", color=src > trail ? color.green : color.red, linewidth=1)
+plotshape(buy,  "Buy",  shape.labelup,   location.belowbar, color.green, text="BUY",  textcolor=color.white, size=size.tiny)
+plotshape(sell, "Sell", shape.labeldown, location.abovebar, color.red,   text="SELL", textcolor=color.white, size=size.tiny)
+
+alertcondition(buy,  "CrossXv2 LONG",  '{"token":"crossx_A92kLm7QxP41vR8nTy5Zc","action":"buy","symbol":"{{ticker}}"}')
+alertcondition(sell, "CrossXv2 SHORT", '{"token":"crossx_A92kLm7QxP41vR8nTy5Zc","action":"sell","symbol":"{{ticker}}"}')

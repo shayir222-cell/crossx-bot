@@ -54,18 +54,22 @@ ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))     
 
 BASE_URL = 'https://api.bitget.com'
 
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT',
-           'TONUSDT', 'LINKUSDT', 'AVAXUSDT']
+# Narrowed to TONUSDT only after 30d backtest showed -0.305R overall expectancy,
+# with TON as the only positive-expectancy symbol (+0.109R, PF=1.16).
+# Other 6 pairs lost between -$24 and -$229 in the simulation. Capital
+# preservation first; broader universe will return after strategy improvements
+# show positive backtest expectancy on multiple symbols.
+SYMBOLS = ['TONUSDT']
 
-# ─── Min ATR % per symbol (filters "sleeping" markets) ───
+# Full per-symbol thresholds kept for fast re-enablement post-improvements.
 MIN_ATR_PCT = {
-    'BTCUSDT':  0.00080,  # 0.08% → ~$62 min ATR at $78k (fee-efficient at 7x)
-    'ETHUSDT':  0.00090,  # 0.09% → ~$3.4 min ATR at $3800
-    'BNBUSDT':  0.00120,  # 0.12% → ~$0.74 min ATR at $615
-    'XRPUSDT':  0.00150,  # 0.15% → ~$0.003 min ATR at $2.3
-    'TONUSDT':  0.00120,  # 0.12% — moderate altcoin volatility
-    'LINKUSDT': 0.00130,  # 0.13% — moderate altcoin volatility
-    'AVAXUSDT': 0.00130,  # 0.13% — moderate altcoin volatility
+    'BTCUSDT':  0.00080,
+    'ETHUSDT':  0.00090,
+    'BNBUSDT':  0.00120,
+    'XRPUSDT':  0.00150,
+    'TONUSDT':  0.00120,
+    'LINKUSDT': 0.00130,
+    'AVAXUSDT': 0.00130,
 }
 
 # ─── Risk ────────────────────────────────────────────────
