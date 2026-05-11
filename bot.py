@@ -771,11 +771,14 @@ def get_session():
     h = datetime.now(timezone.utc).hour
     in_ld = LONDON_OPEN <= h < LONDON_CLOSE
     in_ny = NY_OPEN <= h < NY_CLOSE
-    if in_ld and in_ny: return 'London/NY Overlap', 0.0
-    elif in_ld:         return 'London', 0.0
+    # Statistics-collection mode: all sessions enabled at mult=1.0 for
+    # uniform risk comparison across sessions. Quality protected by
+    # MIN_SCORE=92, MTF, ATR, news, cooldowns, daily DD halt.
+    if in_ld and in_ny: return 'London/NY Overlap', 1.0
+    elif in_ld:         return 'London', 1.0
     elif in_ny:         return 'New York', 1.0
-    elif 0 <= h < 7:    return 'Asian', 1.0   # enabled: score+ATR filters protect quality
-    else:               return 'Off-session', 0.0  # blocked: 21-00 UTC dead zone
+    elif 0 <= h < 7:    return 'Asian', 1.0
+    else:               return 'Off-session', 1.0
 
 def is_session_blocked():
     _, mult = get_session()
@@ -1633,10 +1636,8 @@ async def webhook(request: Request):
         log_signal(symbol, action, 0, {}, 'filtered', f'{session_name} — low liquidity', session_name)
         return JSONResponse({'status': 'filtered', 'reason': f'{session_name} — trading blocked (low liquidity)'})
 
-    # Asian session (0-7 UTC): longs only — crypto has upward bias in Asian hours
-    if session_name == 'Asian' and side == 'short':
-        log_signal(symbol, action, 0, {}, 'filtered', 'Asian session — shorts blocked (upward bias)', session_name)
-        return JSONResponse({'status': 'filtered', 'reason': 'Asian session — shorts blocked'})
+    # Statistics-collection mode: Asian shorts unblocked. Crypto-bias hypothesis
+    # will be re-evaluated against real data after sample size reaches 50+ trades.
 
     # Patch 4 — global loss-streak pause (3 losses → 1h)
     sp_active, sp_reason = is_streak_paused()
