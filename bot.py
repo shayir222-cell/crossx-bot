@@ -449,9 +449,13 @@ def send_daily_report(chat_id=None):
 
 _tg_offset = 0
 _last_eod_date = ''
+_last_perf_date = ''
+PERF_REPORT_HOUR = int(os.environ.get('PERF_REPORT_HOUR', '0'))     # 00:xx UTC
+PERF_REPORT_MIN  = int(os.environ.get('PERF_REPORT_MIN', '30'))     # xx:30
+ENABLE_PERF_REPORT = _flag('ENABLE_PERF_REPORT', True)
 
 def tg_polling():
-    global _tg_offset, _last_eod_date
+    global _tg_offset, _last_eod_date, _last_perf_date
     while True:
         try:
             updates = get_tg_updates(_tg_offset)
@@ -466,6 +470,12 @@ def tg_polling():
                     send_dashboard(cid)
                 elif text in ('/report', '/daily'):
                     tg_to(cid, build_daily_report())
+                elif text in ('/perf', '/performance', '/stats'):
+                    try:
+                        import analyze as _analyze
+                        tg_to(cid, _analyze.build_telegram_perf_report(DB_PATH))
+                    except Exception as e:
+                        tg_to(cid, f'⚠️ perf report error: {e}')
                 elif text == '/start':
                     tg_to(cid,
                         '🤖 <b>CrossX Pro Bot</b>\n\n'
@@ -473,6 +483,7 @@ def tg_polling():
                         '/dashboard — дашборд + советник\n'
                         '/d — то же самое (короче)\n'
                         '/report — детальный дневной отчёт\n'
+                        '/perf — performance отчёт (24h/3d/7d/30d)\n'
                     )
         except Exception as e:
             print(f'[TG POLL] {e}')
@@ -483,6 +494,20 @@ def tg_polling():
         if now.hour == 23 and now.minute >= 55 and _last_eod_date != today:
             _last_eod_date = today
             send_daily_report()
+
+        # Daily performance report (4-window) at configurable UTC hour.
+        # Default: 00:30 UTC — right after midnight, EOD already fired.
+        if (ENABLE_PERF_REPORT
+                and now.hour == PERF_REPORT_HOUR
+                and now.minute >= PERF_REPORT_MIN
+                and _last_perf_date != today):
+            _last_perf_date = today
+            try:
+                import analyze as _analyze
+                tg(_analyze.build_telegram_perf_report(DB_PATH))
+                logger.log_event('perf_report_sent', date=today)
+            except Exception as e:
+                logger.log_warning('perf_report_failed', error=str(e)[:200])
 
         time.sleep(3)
 

@@ -90,6 +90,12 @@ def _stats_from_trades(trades):
     pnls = [float(t.get('pnl_pct') or 0) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
+    total_loss = abs(sum(losses))
+    # PF: ∞ when no losses (cap at 99.99 for display); 0 when no wins.
+    if total_loss == 0:
+        pf_val = 99.99 if wins else 0.0
+    else:
+        pf_val = round(sum(wins) / total_loss, 2)
     return {
         'trades':       len(trades),
         'wins':         len(wins),
@@ -98,7 +104,7 @@ def _stats_from_trades(trades):
         'exp_pct':      round(_safe_div(sum(pnls), len(trades)), 3),
         'avg_win':      round(_safe_div(sum(wins), len(wins)), 3),
         'avg_loss':     round(_safe_div(sum(losses), len(losses)), 3),
-        'pf':           round(_safe_div(sum(wins), abs(sum(losses)) or 1e-9), 2),
+        'pf':           pf_val,
         'total_pnl_pct': round(sum(pnls), 2),
     }
 
@@ -236,6 +242,99 @@ def build_report(db_path: str, since: str = '', fmt: str = 'markdown') -> str:
             out.append(f'    - {r}: {cnt}')
 
     return '\n'.join(out)
+
+
+def build_telegram_perf_report(db_path: str,
+                                 windows=('24h', '3d', '7d', '30d')) -> str:
+    """Compact multi-window performance summary for Telegram (HTML).
+    Stays under 4096 chars. Default windows: 24h, 3d, 7d, 30d."""
+    if not os.path.exists(db_path):
+        return f'⚠️ DB not found: <code>{db_path}</code>'
+
+    out = []
+    out.append('📊 <b>CrossX Performance Report</b>')
+    out.append('━━━━━━━━━━━━━━━━━━━')
+
+    labels = {'24h': '24 hours', '3d': '3 days', '7d': '7 days',
+              '30d': '30 days', '2w': '2 weeks'}
+
+    longest_window_data = None
+    for w in windows:
+        try:
+            conn = sqlite3.connect(db_path)
+            since_ts = _parse_since(w)
+            trades = _fetch_trades(conn, since_ts)
+            signals = _fetch_signals(conn, since_ts)
+            conn.close()
+        except Exception as e:
+            out.append(f'\n⏰ <b>{labels.get(w, w)}</b>\n  ⚠️ read error: {e}')
+            continue
+
+        s = _stats_from_trades(trades)
+        out.append(f'\n⏰ <b>{labels.get(w, w)}</b>')
+        if s.get('trades', 0) == 0:
+            out.append('  <i>no closed trades</i>')
+            continue
+
+        out.append(
+            f'  Trades: <b>{s["trades"]}</b> | '
+            f'WR: <b>{s["wr"]:.1f}%</b> | '
+            f'Exp: <b>{s["exp_pct"]:+.2f}%</b>'
+        )
+        out.append(
+            f'  PnL: <b>{s["total_pnl_pct"]:+.2f}%</b> | '
+            f'PF: <b>{s["pf"]:.2f}</b> | '
+            f'AvgW: {s["avg_win"]:+.2f}% AvgL: {s["avg_loss"]:+.2f}%'
+        )
+
+        # Top/worst symbol
+        by_sym = _group_by(trades, 'symbol')
+        sym_pnls = [(sym, sum(float(t.get('pnl_pct') or 0) for t in ts))
+                    for sym, ts in by_sym.items()]
+        sym_pnls.sort(key=lambda x: x[1])
+        if len(sym_pnls) >= 1:
+            best = sym_pnls[-1]
+            out.append(f'  🏆 {best[0]}: <b>{best[1]:+.2f}%</b>')
+        if len(sym_pnls) >= 2:
+            worst = sym_pnls[0]
+            out.append(f'  💀 {worst[0]}: <b>{worst[1]:+.2f}%</b>')
+
+        # Funnel for 24h
+        if w == '24h':
+            sig_total = len(signals)
+            sig_taken = sum(1 for x in signals if (x.get('status') or '').lower() == 'taken')
+            take_rate = _safe_div(sig_taken, sig_total) * 100
+            out.append(
+                f'  Signals: {sig_total} | Taken: {sig_taken} | '
+                f'Rate: {take_rate:.1f}%'
+            )
+
+        # Keep last window data for the per-symbol detail block
+        longest_window_data = (w, trades, by_sym)
+
+    # Per-symbol breakdown for the longest window
+    if longest_window_data:
+        w, trades, by_sym = longest_window_data
+        out.append(f'\n📌 <b>Per-symbol ({labels.get(w, w)})</b>')
+        out.append('<pre>')
+        out.append(f'{"Pair":9}{"N":>4} {"WR%":>5} {"Exp%":>7} {"PF":>6}')
+        for sym in sorted(by_sym.keys()):
+            ts = by_sym[sym]
+            sym_stats = _stats_from_trades(ts)
+            if sym_stats.get('trades', 0) == 0:
+                continue
+            out.append(
+                f'{sym:9}{sym_stats["trades"]:>4} '
+                f'{sym_stats["wr"]:>5.1f} '
+                f'{sym_stats["exp_pct"]:>+7.2f} '
+                f'{sym_stats["pf"]:>6.2f}'
+            )
+        out.append('</pre>')
+
+    text = '\n'.join(out)
+    if len(text) > 4000:
+        text = text[:3990] + '\n...(truncated)'
+    return text
 
 
 def main():
