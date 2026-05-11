@@ -49,14 +49,18 @@ LATENCY_ANOMALY_MS     = int(os.environ.get('LATENCY_ANOMALY_MS', '3000'))
 
 BASE_URL = 'https://api.bitget.com'
 
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT',
+           'TONUSDT', 'LINKUSDT', 'AVAXUSDT']
 
 # ─── Min ATR % per symbol (filters "sleeping" markets) ───
 MIN_ATR_PCT = {
-    'BTCUSDT': 0.00080,  # 0.08% → ~$62 min ATR at $78k (fee-efficient at 7x)
-    'ETHUSDT': 0.00090,  # 0.09% → ~$3.4 min ATR at $3800
-    'BNBUSDT': 0.00120,  # 0.12% → ~$0.74 min ATR at $615
-    'XRPUSDT': 0.00150,  # 0.15% → ~$0.003 min ATR at $2.3
+    'BTCUSDT':  0.00080,  # 0.08% → ~$62 min ATR at $78k (fee-efficient at 7x)
+    'ETHUSDT':  0.00090,  # 0.09% → ~$3.4 min ATR at $3800
+    'BNBUSDT':  0.00120,  # 0.12% → ~$0.74 min ATR at $615
+    'XRPUSDT':  0.00150,  # 0.15% → ~$0.003 min ATR at $2.3
+    'TONUSDT':  0.00120,  # 0.12% — moderate altcoin volatility
+    'LINKUSDT': 0.00130,  # 0.13% — moderate altcoin volatility
+    'AVAXUSDT': 0.00130,  # 0.13% — moderate altcoin volatility
 }
 
 # ─── Risk ────────────────────────────────────────────────
@@ -91,8 +95,9 @@ SL_COOLDOWN = 15  # minutes cooldown after any SL hit
 
 # ─── Correlation groups (don't open same-direction in same group) ─
 CORR_GROUPS = [
-    {'BTCUSDT', 'ETHUSDT'},        # ~0.85 correlation
-    {'BNBUSDT', 'XRPUSDT'},        # altcoin group
+    {'BTCUSDT', 'ETHUSDT'},                          # ~0.85 correlation
+    {'BNBUSDT', 'XRPUSDT'},                          # altcoin group
+    {'LINKUSDT', 'AVAXUSDT', 'TONUSDT'},             # layer-1 / utility alts
 ]
 
 # ─── Time stop ───────────────────────────────────────────
@@ -381,11 +386,13 @@ def build_daily_report():
         f' NY:      {by_sess.get("New York", 0)}\n'
         '\n'
         '<b>By symbol:</b>\n'
-        f' BTC: {by_sym.get("BTCUSDT", 0)}\n'
-        f' ETH: {by_sym.get("ETHUSDT", 0)}\n'
-        f' SOL: {by_sym.get("SOLUSDT", 0)}\n'
-        f' XRP: {by_sym.get("XRPUSDT", 0)}\n'
-        f' BNB: {by_sym.get("BNBUSDT", 0)}\n'
+        f' BTC:  {by_sym.get("BTCUSDT", 0)}\n'
+        f' ETH:  {by_sym.get("ETHUSDT", 0)}\n'
+        f' BNB:  {by_sym.get("BNBUSDT", 0)}\n'
+        f' XRP:  {by_sym.get("XRPUSDT", 0)}\n'
+        f' TON:  {by_sym.get("TONUSDT", 0)}\n'
+        f' LINK: {by_sym.get("LINKUSDT", 0)}\n'
+        f' AVAX: {by_sym.get("AVAXUSDT", 0)}\n'
         '\n'
         f'State:     {state}\n'
         f'Risk mult: ×{risk_mult}\n'
