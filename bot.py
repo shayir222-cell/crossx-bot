@@ -14,6 +14,7 @@ import logger    # structured JSON event logger
 import metrics   # in-memory counters/gauges
 import alerts    # severity-tagged Telegram wrapper
 import stability_audit  # readiness scoring engine
+import funding   # funding rate fetcher (optional filter)
 
 app = FastAPI(title="CrossX Pro Bot v3.0")
 
@@ -45,7 +46,11 @@ ENABLE_SYMBOL_METRICS  = _flag('ENABLE_SYMBOL_METRICS', True)    # per-symbol co
 ENABLE_LATENCY_AUDIT   = _flag('ENABLE_LATENCY_AUDIT', True)     # webhook stage timing + DB rows
 ENABLE_SOAK_VALIDATION = _flag('ENABLE_SOAK_VALIDATION', False)  # background soak validator
 ENABLE_FILL_TRACKING   = _flag('ENABLE_FILL_TRACKING', False)    # WebSocket fills (off by default)
+ENABLE_FUNDING_FILTER  = _flag('ENABLE_FUNDING_FILTER', False)   # block trades when funding heavily favors opposite side
+ENABLE_REGIME_FILTER   = _flag('ENABLE_REGIME_FILTER', False)    # block trades in ranging markets (ADX < threshold)
 LATENCY_ANOMALY_MS     = int(os.environ.get('LATENCY_ANOMALY_MS', '3000'))
+FUNDING_THRESHOLD_PCT  = float(os.environ.get('FUNDING_THRESHOLD_PCT', '0.10'))  # block if |funding| > this
+ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))      # block if ADX < this (ranging)
 
 BASE_URL = 'https://api.bitget.com'
 
@@ -630,6 +635,73 @@ def calc_rsi(candles, period=14):
     if al == 0:
         return 100.0
     return 100 - (100 / (1 + ag / al))
+
+
+def calc_adx(candles, period=14):
+    """Average Directional Index — trend strength (0-100).
+
+    Returns 0.0 if insufficient data.
+
+    Interpretation:
+      < 20  → ranging / chop
+      20-25 → developing trend
+      > 25  → strong trend
+      > 40  → very strong trend
+    """
+    if not candles or len(candles) < (period * 2 + 1):
+        return 0.0
+    try:
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+
+        tr, plus_dm, minus_dm = [], [], []
+        for i in range(1, len(candles)):
+            h, l, pc = highs[i], lows[i], closes[i-1]
+            tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+            up   = highs[i] - highs[i-1]
+            down = lows[i-1] - lows[i]
+            plus_dm.append(up   if (up   > down and up   > 0) else 0.0)
+            minus_dm.append(down if (down > up   and down > 0) else 0.0)
+
+        # Wilder running smoothing (sum-style, used for TR/DM):
+        # init = sum of first `period`, then prev - prev/period + new
+        def wilder_sum(values, p):
+            if len(values) < p:
+                return []
+            out = [sum(values[:p])]
+            for v in values[p:]:
+                out.append(out[-1] - out[-1] / p + v)
+            return out
+
+        tr_s  = wilder_sum(tr, period)
+        pdm_s = wilder_sum(plus_dm, period)
+        mdm_s = wilder_sum(minus_dm, period)
+        if not tr_s:
+            return 0.0
+
+        # DX series (one DX per smoothed bar)
+        dx_list = []
+        for tr_v, pdm_v, mdm_v in zip(tr_s, pdm_s, mdm_s):
+            if tr_v == 0:
+                dx_list.append(0.0)
+                continue
+            plus_di  = 100.0 * pdm_v / tr_v
+            minus_di = 100.0 * mdm_v / tr_v
+            denom = plus_di + minus_di
+            dx_list.append(0.0 if denom == 0 else 100.0 * abs(plus_di - minus_di) / denom)
+
+        if len(dx_list) < period:
+            return sum(dx_list) / max(len(dx_list), 1)
+        # ADX = Wilder MOVING AVERAGE of DX:
+        # init = average of first `period` DX values
+        # subsequent: (prev * (period-1) + new) / period
+        adx = sum(dx_list[:period]) / period
+        for v in dx_list[period:]:
+            adx = (adx * (period - 1) + v) / period
+        return max(0.0, min(100.0, float(adx)))
+    except Exception:
+        return 0.0
 
 def get_tf_bias(symbol, gran):
     candles = get_candles(symbol, gran, 55)
@@ -1677,6 +1749,21 @@ async def webhook(request: Request):
         log_signal(symbol, action, 0, {}, 'filtered', corr_reason, session_name)
         return JSONResponse({'status': 'filtered', 'reason': corr_reason})
 
+    # Upgrade #2 — Funding rate filter (optional, off by default).
+    # Blocks trades when funding strongly favors taking the opposite side.
+    # Fail-open: if rate fetch fails, signal proceeds.
+    if ENABLE_FUNDING_FILTER:
+        try:
+            f_blocked, f_reason, f_rate = funding.is_funding_unfavorable(
+                symbol, side, threshold_pct=FUNDING_THRESHOLD_PCT)
+            if f_blocked:
+                log_signal(symbol, action, 0, {}, 'filtered', f'Funding: {f_reason}', session_name)
+                metrics.inc('funding_blocks_total')
+                return JSONResponse({'status': 'filtered', 'reason': f'Funding: {f_reason}',
+                                     'funding_rate_pct': round((f_rate or 0) * 100, 6)})
+        except Exception:
+            pass  # fail-open
+
     # Balance
     balance = get_balance()
     if not balance:
@@ -1697,6 +1784,21 @@ async def webhook(request: Request):
     atr   = calc_atr(candles_5m)
     if atr == 0:
         atr = price * 0.005
+
+    # Upgrade #3 — ADX regime filter (optional, off by default).
+    # Blocks trades in ranging/chop markets where ATR-trail strategies fail.
+    if ENABLE_REGIME_FILTER:
+        try:
+            adx_val = calc_adx(candles_5m, period=14)
+            if 0 < adx_val < ADX_MIN_THRESHOLD:
+                log_signal(symbol, action, 0, {}, 'filtered',
+                           f'Regime: ADX {adx_val:.1f} < {ADX_MIN_THRESHOLD} (ranging)', session_name)
+                metrics.inc('regime_blocks_total')
+                return JSONResponse({'status': 'filtered',
+                                     'reason': f'Ranging market: ADX {adx_val:.1f} < {ADX_MIN_THRESHOLD}',
+                                     'adx': round(adx_val, 2)})
+        except Exception:
+            pass  # fail-open
 
     # Score
     score, breakdown = score_signal(symbol, side, candles_5m, data)
