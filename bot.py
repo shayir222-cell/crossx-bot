@@ -65,6 +65,31 @@ BASE_URL = 'https://api.bitget.com'
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT',
            'TONUSDT', 'LINKUSDT', 'AVAXUSDT']
 
+# Per-pair calibration from 30d backtest (TP_R sweep, ADX>=20 + longs only):
+#   Profitable pairs use their best TP_R + base MIN_SCORE.
+#   Losing pairs get strict MIN_SCORE to drastically reduce volume + bleed.
+PAIR_TP_R = {
+    'TONUSDT':  2.5,   # +0.465R at this TP
+    'AVAXUSDT': 3.0,   # +0.190R best
+    'LINKUSDT': 5.0,   # near break-even at TP_R=5
+    'ETHUSDT':  5.0,   # losing -0.153R, biggest improvement at 5.0
+    'BNBUSDT':  4.0,   # losing -0.187R, slight better at 4.0
+    'BTCUSDT':  4.0,   # losing -0.359R; volume-restricted via MIN_SCORE below
+    'XRPUSDT':  3.0,   # losing -0.562R; volume-restricted via MIN_SCORE below
+}
+
+# Stricter MIN_SCORE for losing pairs reduces trade volume by ~70-90%,
+# leaving only top-quality signals. Profitable pairs keep base MIN_SCORE.
+PAIR_MIN_SCORE = {
+    'TONUSDT':   92,   # base
+    'AVAXUSDT':  92,   # base
+    'LINKUSDT':  94,
+    'ETHUSDT':   96,
+    'BNBUSDT':   97,
+    'BTCUSDT':   98,
+    'XRPUSDT':  100,   # only perfect signals
+}
+
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
 MIN_ATR_PCT = {
     'BTCUSDT':  0.00080,
@@ -1808,12 +1833,13 @@ async def webhook(request: Request):
         except Exception:
             pass  # fail-open
 
-    # Score
+    # Score with per-pair MIN_SCORE override (data-driven from backtest sweep)
     score, breakdown = score_signal(symbol, side, candles_5m, data)
-    if score < MIN_SCORE:
-        log_signal(symbol, action, score, breakdown, 'filtered', f'Score {score} < {MIN_SCORE}', session_name)
-        print(f'[FILTER] {symbol} Score {score}/100 < {MIN_SCORE}')
-        return JSONResponse({'status': 'filtered', 'score': score, 'reason': f'Score {score}/100 < {MIN_SCORE}', 'breakdown': breakdown})
+    pair_min_score = PAIR_MIN_SCORE.get(symbol, MIN_SCORE)
+    if score < pair_min_score:
+        log_signal(symbol, action, score, breakdown, 'filtered', f'Score {score} < {pair_min_score} (pair)', session_name)
+        print(f'[FILTER] {symbol} Score {score}/100 < {pair_min_score}')
+        return JSONResponse({'status': 'filtered', 'score': score, 'reason': f'Score {score}/100 < {pair_min_score}', 'breakdown': breakdown})
 
     # MTF gate
     mtf_ok, mtf_info = check_mtf(symbol, side)
@@ -1853,14 +1879,15 @@ async def webhook(request: Request):
         size = max_size
         print(f'[SIZE CAP] {symbol} capped to {size} (20% margin limit)')
 
-    # Levels
+    # Levels — per-pair TP1_R override (data-driven from backtest sweep)
+    pair_tp1_r = PAIR_TP_R.get(symbol, TP1_R)
     if side == 'long':
         sl_price  = round(price - sl_dist, 4)
-        tp1_price = round(price + sl_dist * TP1_R, 4)
+        tp1_price = round(price + sl_dist * pair_tp1_r, 4)
         tp2_price = round(price + sl_dist * TP2_R, 4)
     else:
         sl_price  = round(price + sl_dist, 4)
-        tp1_price = round(price - sl_dist * TP1_R, 4)
+        tp1_price = round(price - sl_dist * pair_tp1_r, 4)
         tp2_price = round(price - sl_dist * TP2_R, 4)
 
     # Log signal as taken before placing order
