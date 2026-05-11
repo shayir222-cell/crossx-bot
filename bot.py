@@ -1535,6 +1535,19 @@ async def webhook(request: Request):
     t_parse_done = time.time()
     _stages.append(('parse', t_request_start, t_parse_done))
 
+    # Phase C diag: count every successfully-parsed webhook (baseline)
+    try:
+        metrics.inc('webhook_requests_total', status='received')
+        logger.log_event('webhook_received',
+                         symbol=str(data.get('symbol', ''))[:32],
+                         action=str(data.get('action', ''))[:16],
+                         has_token=bool(data.get('token')),
+                         has_score=('score' in data),
+                         has_macro=('macro_trend' in data),
+                         payload_keys=list(data.keys())[:20])
+    except Exception:
+        pass
+
     if data.get('token') != WEBHOOK_TOKEN:
         # Observability: count + log invisible-auth rejections (Phase C diag)
         try:
@@ -1583,6 +1596,15 @@ async def webhook(request: Request):
         return JSONResponse({'status': 'closed'})
 
     if action not in ('buy', 'sell'):
+        # Phase C diag: count + log unknown actions
+        try:
+            metrics.inc('webhook_requests_total', status='unknown_action')
+            logger.log_warning('webhook_unknown_action',
+                               received_action=str(action)[:32],
+                               symbol=symbol,
+                               payload_keys=list(data.keys())[:20])
+        except Exception:
+            pass
         return JSONResponse({'error': f'unknown action: {action}'})
 
     # Patch P9 — define `side` BEFORE any check that uses it
