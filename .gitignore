@@ -13,3 +13,6 @@ venv/
 crossx.db
 *.log
 logs/
+
+# Backtest sweep artifacts (large, run-specific, regeneratable)
+backtest_*.csv
