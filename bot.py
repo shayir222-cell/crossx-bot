@@ -59,35 +59,18 @@ ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))     
 
 BASE_URL = 'https://api.bitget.com'
 
-# All 7 pairs enabled. Per-pair calibration applied via PAIR_MIN_SCORE and
-# PAIR_TP_R below (data-driven from 30d backtest sweep). ADX gate (default ON)
-# filters ranging markets across all pairs.
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT',
-           'TONUSDT', 'LINKUSDT', 'AVAXUSDT']
+SYMBOLS = ['TONUSDT', 'BNBUSDT']
 
-# Per-pair calibration from 30d backtest (TP_R sweep, ADX>=20 + longs only):
-#   Profitable pairs use their best TP_R + base MIN_SCORE.
-#   Losing pairs get strict MIN_SCORE to drastically reduce volume + bleed.
+# Per-pair calibration from 30d backtest sweep (Plan B 2026-05-15):
+# Only TON and BNB had near-break-even EV; other 5 pairs dropped entirely.
 PAIR_TP_R = {
-    'TONUSDT':  2.5,   # +0.465R at this TP
-    'AVAXUSDT': 3.0,   # +0.190R best
-    'LINKUSDT': 5.0,   # near break-even at TP_R=5
-    'ETHUSDT':  5.0,   # losing -0.153R, biggest improvement at 5.0
-    'BNBUSDT':  4.0,   # losing -0.187R, slight better at 4.0
-    'BTCUSDT':  4.0,   # losing -0.359R; volume-restricted via MIN_SCORE below
-    'XRPUSDT':  3.0,   # losing -0.562R; volume-restricted via MIN_SCORE below
+    'TONUSDT': 2.0,   # -0.028R at TP_R=2.0 (best of 1.0/1.5/2.0)
+    'BNBUSDT': 2.0,   # -0.080R at TP_R=2.0
 }
 
-# Stricter MIN_SCORE for losing pairs reduces trade volume by ~70-90%,
-# leaving only top-quality signals. Profitable pairs keep base MIN_SCORE.
 PAIR_MIN_SCORE = {
-    'TONUSDT':   92,   # base
-    'AVAXUSDT':  92,   # base
-    'LINKUSDT':  94,
-    'ETHUSDT':   96,
-    'BNBUSDT':   97,
-    'BTCUSDT':   98,
-    'XRPUSDT':  100,   # only perfect signals
+    'TONUSDT': 92,   # base
+    'BNBUSDT': 92,   # 97→92: prior strict threshold gave 0 takes in live
 }
 
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
@@ -110,7 +93,7 @@ DAILY_LOSS_LIMIT = 0.10
 
 # ─── ATR levels ──────────────────────────────────────────
 SL_ATR_MULT    = 2.5   # увеличение стопа для снижения количества ложных SL
-TP1_R          = 2.5   # unchanged: first TP at 2.5R
+TP1_R          = 2.0   # 2.5→2.0: peak of 30d backtest sweep
 TP2_R          = 5.0   # unchanged: let full winners run
 TRAIL_ATR_MULT = 1.0   # 1.5→1.0: tighter trail after TP1 captures more peak
 MAX_GIVEBACK   = 0.25  # 0.30→0.25: give back even less at peak
@@ -132,11 +115,7 @@ PAUSE_3L   = 60
 SL_COOLDOWN = 15  # minutes cooldown after any SL hit
 
 # ─── Correlation groups (don't open same-direction in same group) ─
-CORR_GROUPS = [
-    {'BTCUSDT', 'ETHUSDT'},                          # ~0.85 correlation
-    {'BNBUSDT', 'XRPUSDT'},                          # altcoin group
-    {'LINKUSDT', 'AVAXUSDT', 'TONUSDT'},             # layer-1 / utility alts
-]
+CORR_GROUPS = []   # TON and BNB are in different sectors → no correlation gate needed
 
 # ─── Time stop ───────────────────────────────────────────
 TIME_STOP_MIN  = 90   # 30→90: give trades time to develop
@@ -424,13 +403,8 @@ def build_daily_report():
         f' NY:      {by_sess.get("New York", 0)}\n'
         '\n'
         '<b>By symbol:</b>\n'
-        f' BTC:  {by_sym.get("BTCUSDT", 0)}\n'
-        f' ETH:  {by_sym.get("ETHUSDT", 0)}\n'
-        f' BNB:  {by_sym.get("BNBUSDT", 0)}\n'
-        f' XRP:  {by_sym.get("XRPUSDT", 0)}\n'
-        f' TON:  {by_sym.get("TONUSDT", 0)}\n'
-        f' LINK: {by_sym.get("LINKUSDT", 0)}\n'
-        f' AVAX: {by_sym.get("AVAXUSDT", 0)}\n'
+        f' TON: {by_sym.get("TONUSDT", 0)}\n'
+        f' BNB: {by_sym.get("BNBUSDT", 0)}\n'
         '\n'
         f'State:     {state}\n'
         f'Risk mult: ×{risk_mult}\n'
@@ -1482,7 +1456,7 @@ def monitor():
                     tg(f'⚡ <b>BE {symbol}</b>\n+1.0R → SL → BE ${entry:,.4f}')
 
                 # TP1: close TP1_SIZE_PCT of position, move SL to BE
-                if not pos['tp1_hit'] and float_r >= TP1_R:
+                if not pos['tp1_hit'] and float_r >= PAIR_TP_R.get(symbol, TP1_R):
                     tp1_size = round(pos['size'] * TP1_SIZE_PCT, 4)
                     if tp1_size >= 0.001:
                         close_side = 'sell' if side == 'long' else 'buy'
