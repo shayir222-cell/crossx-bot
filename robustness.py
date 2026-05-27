@@ -336,44 +336,20 @@ def _q3(window_a_trades):
 def _aligned_log_returns(symbol_a, symbol_b, days, fetch_fn):
     """Fetch 1H closes for both symbols, inner-join on ts, return log-return pairs.
 
-    fetch_fn signature: fetch_fn(symbol, granularity, days) -> list of
-    [ts_ms, open, high, low, close, volume, ...].
+    Delegates to correlation_utils for the actual math so robustness.py and
+    correlation_matrix.py share one implementation. Returns (ra, rb, diag)
+    on success, or (None, None, error_string) on failure.
     """
-    try:
-        ca = fetch_fn(symbol_a, '1H', days)
-        cb = fetch_fn(symbol_b, '1H', days)
-    except Exception as e:
-        return None, None, f'fetch failed: {e}'
-    if not ca or not cb:
-        return None, None, f'empty candles (a:{len(ca) if ca else 0}, b:{len(cb) if cb else 0})'
-
-    map_a = {int(c[0]): float(c[4]) for c in ca}
-    map_b = {int(c[0]): float(c[4]) for c in cb}
-    common = sorted(set(map_a.keys()) & set(map_b.keys()))
-    if len(common) < 50:
-        return None, None, f'too few aligned candles: {len(common)}'
-
-    # Log returns
-    ra = []
-    rb = []
-    n_gap_dropped = 0
-    n_price_invalid = 0
-    for i in range(1, len(common)):
-        ts_prev, ts_curr = common[i - 1], common[i]
-        if ts_curr - ts_prev != 3600 * 1000:
-            n_gap_dropped += 1
-            continue
-        pa_prev = map_a[ts_prev]
-        pa_curr = map_a[ts_curr]
-        pb_prev = map_b[ts_prev]
-        pb_curr = map_b[ts_curr]
-        if pa_prev <= 0 or pa_curr <= 0 or pb_prev <= 0 or pb_curr <= 0:
-            n_price_invalid += 1
-            continue
-        ra.append(math.log(pa_curr / pa_prev))
-        rb.append(math.log(pb_curr / pb_prev))
-    diag = {'n_gap_dropped': n_gap_dropped, 'n_price_invalid': n_price_invalid,
-            'n_common_candles': len(common)}
+    from correlation_utils import fetch_closes_map, pair_log_returns_from_maps
+    map_a, err_a = fetch_closes_map(symbol_a, '1H', days, fetch_fn)
+    if err_a:
+        return None, None, f'fetch {symbol_a}: {err_a}'
+    map_b, err_b = fetch_closes_map(symbol_b, '1H', days, fetch_fn)
+    if err_b:
+        return None, None, f'fetch {symbol_b}: {err_b}'
+    ra, rb, diag = pair_log_returns_from_maps(map_a, map_b)
+    if diag['n_common_candles'] < 50:
+        return None, None, f'too few aligned candles: {diag["n_common_candles"]}'
     return ra, rb, diag
 
 

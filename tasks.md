@@ -54,11 +54,9 @@ Source: [audit_top10_20260527.csv](audit_top10_20260527.csv), [audit_top10_20260
 **Goal:** Single CLI that runs the 4 robustness gates on any candidate pair.
 **Delivered:** PASS/FAIL/INCONCLUSIVE/GRAY per check + overall verdict. Q1 with configurable `--q1-threshold` (default 0.0, recommend 0.05 for live gate alignment). Q2 three-tier ρ thresholds (FAIL<0, GRAY [0,0.3), PASS≥0.3). Q3 ratio ≥ 0.20 with min-20-trades guard. Q4 multi-reference correlation with max-aggregation (PASS<0.6, GRAY [0.6,0.7), FAIL≥0.7). Imports config from `bot.py` (with explicit error reason if drift). Subprocess invocation with UTF-8 + timeout. `--csv-override` for testing. 9.6/10 from code-quality reviewer, 8.5/10 methodology (with documented known limitations).
 
-### Task 3 — Build `correlation_matrix.py`
-**Goal:** 30d log-return Pearson correlation matrix for any list of symbols. Output: heatmap CSV + flag pairs > 0.70.
-**Why:** Methodology requires this for the greedy selection. BTC/ETH/SOL typically correlate > 0.75 — picking two of them gives no diversification.
-**Acceptance:** Run on full top-10 + TON. Produces matrix. Identifies redundant clusters.
-**Effort:** S (~3h).
+### Task 3 — Build `correlation_matrix.py` ✅ DONE 2026-05-27
+**Goal:** 30d log-return Pearson correlation matrix for any list of symbols.
+**Delivered:** Pairwise log-return Pearson with Fisher z 95% CI per cell. Pre-fetches each symbol once (N fetches, not N²) via shared `correlation_utils.py` (also used by robustness.py — refactored to delete duplicated logic). Outputs signed + abs threshold lists (signed = methodology veto; abs catches anti-correlation). CSV matrix with 1.0 diagonal. Symbol dedup, partial-matrix on fetch failures. 9.5/10 code-quality reviewer.
 
 ### Task 4 — Score-bucket monotonicity analyzer
 **Goal:** Per-pair: bucket trades by score (92-93, 94-95, 96-97, 98-100), compute expectancy per bucket, Spearman ρ(score, expectancy). Output: table + ρ values.
