@@ -389,7 +389,8 @@ def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_ba
 
 
 # ── Main backtest loop ────────────────────────────────────────────────
-def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage, adx_min=0.0, strategy='v2'):
+def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage,
+                    adx_min=0.0, strategy='v2', block_hours=None, min_atr_pct=0.0):
     print(f'\n=== {symbol} ===')
     print(f'  Fetching 5m candles ({days}d)...')
     c5  = fetch_candles_range(symbol, '5m',  days)
@@ -438,6 +439,22 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
 
         atr = calc_atr(win5, 14)
         if atr == 0:
+            continue
+
+        # Time-of-day blackout (UTC hour of decision bar -- not fill bar -- to
+        # match what a live signal generator sees at decision time).
+        if block_hours:
+            hour = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).hour
+            if hour in block_hours:
+                continue
+
+        # Volatility-band gate: skip low-vol entries where SL is too tight
+        # to absorb noise. Uses close (decision-time) to match what a live
+        # signal generator sees. Note: the trade-log atr_pct column is
+        # computed as atr/entry*100 (entry = next-bar open) so it differs
+        # from this gate by ~one bar of price drift -- typically <0.1%,
+        # well below the gate's precision.
+        if min_atr_pct > 0.0 and (atr / close) * 100.0 < min_atr_pct:
             continue
 
         # ADX regime gate
@@ -536,7 +553,7 @@ def main():
     p.add_argument('--min_score', type=int, default=92)
     p.add_argument('--sl_atr', type=float, default=2.5)
     p.add_argument('--tp_r', type=float, default=2.5)
-    p.add_argument('--fee_pct', type=float, default=0.06, help='per-side fee % (Bitget taker ~0.06%)')
+    p.add_argument('--fee_pct', type=float, default=0.06, help='per-side fee %% (Bitget taker ~0.06%%)')
     p.add_argument('--leverage', type=int, default=7)
     p.add_argument('--capital', type=float, default=152.60)
     p.add_argument('--risk_pct', type=float, default=0.005)
@@ -546,7 +563,28 @@ def main():
                    help='only take long entries (backtest shows shorts unprofitable)')
     p.add_argument('--strategy', type=str, default='v2', choices=['v2', 'v3'],
                    help='v2 = score-based (current), v3 = triple confirmation Pine')
+    p.add_argument('--block_hours', type=str, default='',
+                   help='comma-separated UTC hours 0-23 to skip entries on (e.g. "2,3,4,5,6,7,8")')
+    p.add_argument('--min_atr_pct', type=float, default=0.0,
+                   help='skip entries where atr/close*100 < this percent (0 = no filter)')
     args = p.parse_args()
+
+    # Parse + validate --block_hours; drop out-of-range values with a warning
+    block_hours = set()
+    if args.block_hours:
+        for tok in args.block_hours.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                h = int(tok)
+            except ValueError:
+                print(f'  [WARN] --block_hours: skipping non-int {tok!r}')
+                continue
+            if 0 <= h <= 23:
+                block_hours.add(h)
+            else:
+                print(f'  [WARN] --block_hours: dropping out-of-range {h}')
 
     symbols = [args.symbol] if args.symbol else \
               ['BTCUSDT','ETHUSDT','BNBUSDT','XRPUSDT','TONUSDT','LINKUSDT','AVAXUSDT']
@@ -560,11 +598,15 @@ def main():
 
     all_trades = []
     all_summary = []
-    print(f'  strategy={args.strategy}  adx_min={args.adx_min}  longs_only={args.longs_only}')
+    print(f'  strategy={args.strategy}  adx_min={args.adx_min}  longs_only={args.longs_only}  '
+          f'block_hours={sorted(block_hours) if block_hours else "(none)"}  '
+          f'min_atr_pct={args.min_atr_pct}')
     for sym in symbols:
         trades = backtest_symbol(sym, args.days, args.min_score, args.sl_atr, args.tp_r,
                                   args.fee_pct, args.leverage, adx_min=args.adx_min,
-                                  strategy=args.strategy) or []
+                                  strategy=args.strategy,
+                                  block_hours=block_hours,
+                                  min_atr_pct=args.min_atr_pct) or []
         summary = report(sym, trades, args.capital, args.risk_pct)
         if summary:
             all_summary.append(summary)

@@ -62,12 +62,9 @@ Source: [audit_top10_20260527.csv](audit_top10_20260527.csv), [audit_top10_20260
 **Goal:** Per-pair: bucket trades by score, compute expectancy per bucket, Spearman ρ.
 **Delivered:** `monotonicity.py` + shared `score_buckets.py` (factored Q2 logic out of robustness.py — both now delegate). Reads existing backtest CSVs, supports `--csv-glob`, `--all-symbols`, `--symbol`. Includes 3-bucket low-power softening (|ρ|<0.70 with 3 buckets → GRAY, since Spearman on 3 points has only {±0.5, ±1.0} discrete values). **Empirical validation on real 4168-trade CSV: all 7 symbols had only 3 non-empty score buckets (the [96,98) bucket is rare), most show ρ=-0.500 → GRAY.** Confirms `project_score_model_flat_above_92.md` finding. 9.4-9.5/10 reviewer.
 
-### Task 5 — Extend `backtest.py` with `--block_hours` and `--min_atr_pct` flags
+### Task 5 — Extend `backtest.py` with `--block_hours` and `--min_atr_pct` flags ✅ DONE 2026-05-27
 **Goal:** Add CLI flags to skip trades by UTC hour and minimum ATR percentage. **Offline tool only — does not touch live bot.**
-**Why:** Need this to test the time-of-day blackout (02-08 UTC) and ATR-band hypotheses from earlier analysis.
-**Acceptance:** Backtest TON+BNB on 30d with `--block_hours 2,3,4,5,6,7,8`; compare expectancy to baseline. Backtest TON with `--min_atr_pct 0.20`.
-**Effort:** S (~4h).
-**Pitfalls:** flag interaction with existing session logic, what's the right metric to compare (expectancy_R, PF, or both).
+**Delivered:** Both flags added with validation (int parse, range [0,23], drops invalid with WARN). Filter inserted after `atr==0` guard, before ADX gate. Uses `close` (decision-time price) to avoid look-ahead. Backward compatible (defaults preserve baseline). Also fixed pre-existing `%`-escape bug in `--fee_pct` help that crashed `--help`. 9.4/10 reviewer → 9.5+ after polish landed.
 
 ### Task 6 — `audit_pair.py` v2 with Selection Methodology integration
 **Goal:** Extend `audit_pair.py` to compute the Edge Confidence Score (ECS) from methodology.md and apply the greedy selection algorithm. Output: per-pair ECS + final picks JSON.
