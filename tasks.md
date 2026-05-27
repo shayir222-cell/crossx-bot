@@ -66,11 +66,9 @@ Source: [audit_top10_20260527.csv](audit_top10_20260527.csv), [audit_top10_20260
 **Goal:** Add CLI flags to skip trades by UTC hour and minimum ATR percentage. **Offline tool only — does not touch live bot.**
 **Delivered:** Both flags added with validation (int parse, range [0,23], drops invalid with WARN). Filter inserted after `atr==0` guard, before ADX gate. Uses `close` (decision-time price) to avoid look-ahead. Backward compatible (defaults preserve baseline). Also fixed pre-existing `%`-escape bug in `--fee_pct` help that crashed `--help`. 9.4/10 reviewer → 9.5+ after polish landed.
 
-### Task 6 — `audit_pair.py` v2 with Selection Methodology integration
-**Goal:** Extend `audit_pair.py` to compute the Edge Confidence Score (ECS) from methodology.md and apply the greedy selection algorithm. Output: per-pair ECS + final picks JSON.
-**Why:** Current audition produces raw stats but doesn't apply the methodology consistently. Want a single source of truth that says "deploy X, Y" given fresh data.
-**Acceptance:** Run on the top-10 audition data — reproduces "ZEC > HYPE > DOGE" ranking with explicit ECS values. Outputs `bot.py` config snippets ready to paste.
-**Effort:** M (~10h).
+### Task 6 — `audit_pair_v2.py` Selection Methodology ✅ DONE 2026-05-27
+**Goal:** ECS-driven pair selection + greedy choice with correlation veto.
+**Delivered:** New file (kept original audit_pair.py untouched). Implements full methodology: ECS = 0.30·E + 0.20·S + 0.20·B + 0.20·M + 0.10·W (rebalanced over available components when M/W missing); hard cap at ECS=50 when B=0; per-tier slippage subtraction; greedy selection with |ρ|≥0.70 veto vs already-selected + production pairs. **Empirical run on `audit_top10_20260527.csv`: ZEC ECS 95.0 → eligible, HYPE 82.0 → eligible, BNB 56/DOGE 54/etc → dropped by ECS<60 floor.** Final picks: **ZEC + HYPE**, with bot.py snippets ready to paste post-soak. 9.4/10 → 9.6 after polish. Optional `--trade-csv` (M_norm), `--window-b-csv` (W_norm), `--ref-symbols` (Q4 correlation), `--no-correlation` for offline.
 
 ### Task 7 — Walk-forward audition on next 30 days
 **Goal:** When live calendar reaches 2026-06-26 (30d from today), re-run the top-10 audition on a fresh 30d window. Compare to today's results. Save delta report.
