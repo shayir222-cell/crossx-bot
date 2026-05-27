@@ -58,11 +58,9 @@ Source: [audit_top10_20260527.csv](audit_top10_20260527.csv), [audit_top10_20260
 **Goal:** 30d log-return Pearson correlation matrix for any list of symbols.
 **Delivered:** Pairwise log-return Pearson with Fisher z 95% CI per cell. Pre-fetches each symbol once (N fetches, not N²) via shared `correlation_utils.py` (also used by robustness.py — refactored to delete duplicated logic). Outputs signed + abs threshold lists (signed = methodology veto; abs catches anti-correlation). CSV matrix with 1.0 diagonal. Symbol dedup, partial-matrix on fetch failures. 9.5/10 code-quality reviewer.
 
-### Task 4 — Score-bucket monotonicity analyzer
-**Goal:** Per-pair: bucket trades by score (92-93, 94-95, 96-97, 98-100), compute expectancy per bucket, Spearman ρ(score, expectancy). Output: table + ρ values.
-**Why:** BNB forensics showed score=100 worse than score=92 on BNB. Audition showed near-zero discrimination across pairs. Need to verify and quantify before using score-based filters per pair.
-**Acceptance:** Run on TON, BNB, ZEC, HYPE, DOGE from existing backtest CSVs. Output Markdown table.
-**Effort:** S (~3h).
+### Task 4 — Score-bucket monotonicity analyzer ✅ DONE 2026-05-27
+**Goal:** Per-pair: bucket trades by score, compute expectancy per bucket, Spearman ρ.
+**Delivered:** `monotonicity.py` + shared `score_buckets.py` (factored Q2 logic out of robustness.py — both now delegate). Reads existing backtest CSVs, supports `--csv-glob`, `--all-symbols`, `--symbol`. Includes 3-bucket low-power softening (|ρ|<0.70 with 3 buckets → GRAY, since Spearman on 3 points has only {±0.5, ±1.0} discrete values). **Empirical validation on real 4168-trade CSV: all 7 symbols had only 3 non-empty score buckets (the [96,98) bucket is rare), most show ρ=-0.500 → GRAY.** Confirms `project_score_model_flat_above_92.md` finding. 9.4-9.5/10 reviewer.
 
 ### Task 5 — Extend `backtest.py` with `--block_hours` and `--min_atr_pct` flags
 **Goal:** Add CLI flags to skip trades by UTC hour and minimum ATR percentage. **Offline tool only — does not touch live bot.**

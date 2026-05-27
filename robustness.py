@@ -83,20 +83,17 @@ except Exception as _e:
     DEFAULT_FEE_PCT = 0.06
     DEFAULT_LEVERAGE = 7
 
+# Score-bucket constants + Q2 logic live in score_buckets.py (shared with
+# monotonicity.py so robustness's Q2 and the standalone analyzer cannot drift).
+from score_buckets import compute_monotonicity as _compute_monotonicity
+
 # Test thresholds
 Q1_MIN_TRADES_PER_WINDOW = 20      # below this, INCONCLUSIVE
 DEFAULT_Q1_THRESHOLD_R = 0.0       # exp >= 0 in BOTH windows; pass --q1-threshold 0.05 to align with live decision gate
-Q2_MIN_NON_EMPTY_BUCKETS = 3
-Q2_FAIL_RHO = 0.0                  # rho < 0 = anti-predictive => FAIL
-Q2_PASS_RHO = 0.30                 # rho >= 0.30 => PASS; [0, 0.30) => GRAY (weak signal)
 Q3_MIN_TOTAL_TRADES = 20
 Q3_BALANCE_THRESHOLD = 0.20
 Q4_GRAY_LO = 0.60                  # tighter than spec's 0.70 -- defensible, document below
 Q4_FAIL_HI = 0.70
-
-# Score buckets: [92, 94), [94, 96), [96, 98), [98, 101)
-SCORE_BUCKETS = [(92, 94), (94, 96), (96, 98), (98, 101)]
-SCORE_MIDPOINTS = [(lo + hi - 1) / 2.0 for lo, hi in SCORE_BUCKETS]
 
 SUBPROCESS_TIMEOUT_SEC = 900
 WINDOW_A_DAYS = 30
@@ -246,68 +243,12 @@ def _q1(trades_all_window, now_ms, q1_threshold):
 
 
 def _q2(window_a_trades):
-    """Q2 -- score-bucket monotonicity (Spearman rho >= 0)."""
-    if not window_a_trades:
-        return {'status': 'INCONCLUSIVE',
-                'reason': 'no trades in window A'}
+    """Q2 -- score-bucket monotonicity (Spearman rho).
 
-    bucket_means = []
-    bucket_counts = []
-    bucket_labels = []
-    for lo, hi in SCORE_BUCKETS:
-        bucket_trades = [t for t in window_a_trades if lo <= t['score'] < hi]
-        if bucket_trades:
-            bucket_means.append(
-                sum(t['r_net'] for t in bucket_trades) / len(bucket_trades))
-            bucket_counts.append(len(bucket_trades))
-        else:
-            bucket_means.append(None)
-            bucket_counts.append(0)
-        bucket_labels.append(f'[{lo},{hi})')
-
-    non_empty_idx = [i for i, m in enumerate(bucket_means) if m is not None]
-    if len(non_empty_idx) < Q2_MIN_NON_EMPTY_BUCKETS:
-        return {
-            'status': 'INCONCLUSIVE',
-            'reason': f'only {len(non_empty_idx)} non-empty score buckets, '
-                      f'need >={Q2_MIN_NON_EMPTY_BUCKETS}',
-            'buckets': [
-                {'label': bucket_labels[i], 'n': bucket_counts[i],
-                 'mean_r_net': bucket_means[i]}
-                for i in range(len(SCORE_BUCKETS))],
-        }
-
-    midpoints = [SCORE_MIDPOINTS[i] for i in non_empty_idx]
-    means = [bucket_means[i] for i in non_empty_idx]
-    try:
-        rho = statistics.correlation(midpoints, means, method='ranked')
-    except (statistics.StatisticsError, AttributeError) as e:
-        return {'status': 'INCONCLUSIVE',
-                'reason': f'spearman computation failed: {e}'}
-
-    if rho < Q2_FAIL_RHO:
-        status = 'FAIL'
-        narrative = 'anti-predictive'
-    elif rho < Q2_PASS_RHO:
-        status = 'GRAY'
-        narrative = 'weak / inconclusive signal'
-    else:
-        status = 'PASS'
-        narrative = 'monotonic+'
-    caveat = None
-    if len(non_empty_idx) == Q2_MIN_NON_EMPTY_BUCKETS:
-        caveat = f'low statistical power (only {Q2_MIN_NON_EMPTY_BUCKETS} buckets)'
-    return {
-        'status': status,
-        'spearman_rho': rho,
-        'reason': f'spearman rho={rho:+.3f} ({narrative}; '
-                  f'FAIL<{Q2_FAIL_RHO}, GRAY [{Q2_FAIL_RHO},{Q2_PASS_RHO}), PASS>={Q2_PASS_RHO})',
-        'caveat': caveat,
-        'buckets': [
-            {'label': bucket_labels[i], 'n': bucket_counts[i],
-             'mean_r_net': bucket_means[i]}
-            for i in range(len(SCORE_BUCKETS))],
-    }
+    Delegates to score_buckets.compute_monotonicity so robustness.py and
+    monotonicity.py share one implementation.
+    """
+    return _compute_monotonicity(window_a_trades)
 
 
 def _q3(window_a_trades):
