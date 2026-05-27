@@ -1,6 +1,6 @@
 """
 CrossX Pro Bot v3.0 — Multi-Symbol Elite Trading System
-BTCUSDT | ETHUSDT | BNBUSDT | SOLUSDT | XRPUSDT
+TONUSDT | ZECUSDT | HYPEUSDT
 Bitget Futures | 5m Timeframe
 """
 import os, json, time, hmac, hashlib, base64, threading
@@ -59,18 +59,25 @@ ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))     
 
 BASE_URL = 'https://api.bitget.com'
 
-SYMBOLS = ['TONUSDT', 'BNBUSDT']
+SYMBOLS = ['TONUSDT', 'ZECUSDT', 'HYPEUSDT']
 
-# Per-pair calibration from 30d backtest sweep (Plan B 2026-05-15):
-# Only TON and BNB had near-break-even EV; other 5 pairs dropped entirely.
+# Per-pair calibration:
+# 2026-05-27: drop BNB (negative live PF 0.40, negative backtest EV -0.228R,
+# anti-predictive score model — score=100 worse than score=92, max_DD 103%
+# in audit). Add ZEC + HYPE per audit_top10_20260527 + audit_pair_v2 ECS
+# (ZEC ECS=95.0 adj_exp=+0.214R, HYPE ECS=82.0 adj_exp=+0.131R, both
+# diversify vs TON with measured 30d 1H log-return corr +0.241 / +0.259 —
+# well below the 0.70 veto threshold).
 PAIR_TP_R = {
-    'TONUSDT': 2.0,   # -0.028R at TP_R=2.0 (best of 1.0/1.5/2.0)
-    'BNBUSDT': 2.0,   # -0.080R at TP_R=2.0
+    'TONUSDT':  2.0,
+    'ZECUSDT':  2.0,
+    'HYPEUSDT': 2.0,
 }
 
 PAIR_MIN_SCORE = {
-    'TONUSDT': 92,   # base
-    'BNBUSDT': 92,   # 97→92: prior strict threshold gave 0 takes in live
+    'TONUSDT':  92,
+    'ZECUSDT':  92,
+    'HYPEUSDT': 92,
 }
 
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
@@ -82,6 +89,8 @@ MIN_ATR_PCT = {
     'TONUSDT':  0.00120,
     'LINKUSDT': 0.00130,
     'AVAXUSDT': 0.00130,
+    'ZECUSDT':  0.00120,  # 2026-05-27: TON-tier (mid-cap perp, conservative)
+    'HYPEUSDT': 0.00130,  # 2026-05-27: newer listing, slightly higher floor
 }
 
 # ─── Risk ────────────────────────────────────────────────
@@ -115,7 +124,7 @@ PAUSE_3L   = 60
 SL_COOLDOWN = 15  # minutes cooldown after any SL hit
 
 # ─── Correlation groups (don't open same-direction in same group) ─
-CORR_GROUPS = []   # TON and BNB are in different sectors → no correlation gate needed
+CORR_GROUPS = []   # TON/ZEC/HYPE pairwise 30d log-return corr <0.31 (well below 0.70 veto) → no group needed
 
 # ─── Time stop ───────────────────────────────────────────
 TIME_STOP_MIN  = 90   # 30→90: give trades time to develop
@@ -403,9 +412,8 @@ def build_daily_report():
         f' NY:      {by_sess.get("New York", 0)}\n'
         '\n'
         '<b>By symbol:</b>\n'
-        f' TON: {by_sym.get("TONUSDT", 0)}\n'
-        f' BNB: {by_sym.get("BNBUSDT", 0)}\n'
-        '\n'
+        + ''.join(f' {sym[:-4] if sym.endswith("USDT") else sym}: {by_sym.get(sym, 0)}\n' for sym in SYMBOLS)
+        + '\n'
         f'State:     {state}\n'
         f'Risk mult: ×{risk_mult}\n'
         f'Leverage:  {LEVERAGE}x\n'
