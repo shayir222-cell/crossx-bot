@@ -51,6 +51,10 @@ import requests
 # ── Bitget public candle endpoint ─────────────────────────────────────
 BASE_URL = 'https://api.bitget.com'
 
+# Module-level default so backtest_symbol() works when imported (not only via
+# main()'s argparse). main() overrides this via `global _LONGS_ONLY`.
+_LONGS_ONLY = False
+
 def fetch_candles_batch(symbol: str, granularity: str, end_ts_ms: int, limit: int = 1000, max_retries: int = 3):
     """Fetch up to `limit` candles ending at end_ts_ms with retry on SSL/network errors.
     Bitget returns ASC order. Each candle: [ts, o, h, l, c, vol, quote_vol]"""
