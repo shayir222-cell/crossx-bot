@@ -45,22 +45,14 @@ Source: [audit_top10_20260527.csv](audit_top10_20260527.csv), [audit_top10_20260
 
 ## SOAK-SAFE (executable during active soak)
 
-### Task 1 — Build `confidence.py` (bootstrap CI tool)
+### Task 1 — Build `confidence.py` (bootstrap CI tool) ✅ DONE 2026-05-27 (commit 4e06f5f)
 **Goal:** Compute 95% bootstrap CI on PF and expectancy for any subset of live trades. Output: CLI tool that takes `--symbol --days --metric` and prints CI + recommended N for ±0.10R confidence.
 **Why:** Decision gate (≥+0.05R → Phase 1) is currently asked of n=22 TON sample; SE ≈ 0.23R → can't reject "no edge". Need this tool to make defensible Phase 0 → Phase 1 call.
-**Acceptance:** Tool runs on existing DB. Applied to TON live: outputs CI and recommended additional trades needed.
-**Effort:** S (~4h).
-**Pre-task pitfalls to flag:** bootstrap bias on small n, what statistic (PF vs expectancy R) is most informative, how to handle censored trades (open positions).
+**Delivered:** Percentile bootstrap on expectancy, log-PF transform for heavy-tailed PF; one-sided LB at requested confidence; chi-square CI on σ → n_needed range via Wilson-Hilferty; N<5 refused; uniform JSON schema across all paths; stdlib only. Reviewed by 2 independent agents x 3 rounds, final 9.5/10 from both (code quality + statistical rigor angles).
 
-### Task 2 — Build `robustness.py` (Q1-Q4 pre-deploy checker)
-**Goal:** Single CLI that runs the 4 robustness gates from `methodology.md` on any candidate pair:
-- Q1: backtest two non-overlapping 30d windows (today-30 vs today-90 to today-60); both must show exp > 0
-- Q2: Spearman correlation between score bucket (92,94,96,98,100) and expectancy; reject if < 0
-- Q3: L/S balance ≥ 0.20
-- Q4: 30d log-return correlation with TONUSDT < 0.70
-**Acceptance:** Run on each of ZEC, HYPE, DOGE — produces pass/fail per Q. Applied as sanity check on BNB: must FAIL (reproduces known result).
-**Effort:** M (~8h).
-**Pitfalls:** windowing edge cases, what to do if a pair has < 30d of data (HYPE may), correlation method (Pearson vs Spearman on returns).
+### Task 2 — Build `robustness.py` (Q1-Q4 pre-deploy checker) ✅ DONE 2026-05-27
+**Goal:** Single CLI that runs the 4 robustness gates on any candidate pair.
+**Delivered:** PASS/FAIL/INCONCLUSIVE/GRAY per check + overall verdict. Q1 with configurable `--q1-threshold` (default 0.0, recommend 0.05 for live gate alignment). Q2 three-tier ρ thresholds (FAIL<0, GRAY [0,0.3), PASS≥0.3). Q3 ratio ≥ 0.20 with min-20-trades guard. Q4 multi-reference correlation with max-aggregation (PASS<0.6, GRAY [0.6,0.7), FAIL≥0.7). Imports config from `bot.py` (with explicit error reason if drift). Subprocess invocation with UTF-8 + timeout. `--csv-override` for testing. 9.6/10 from code-quality reviewer, 8.5/10 methodology (with documented known limitations).
 
 ### Task 3 — Build `correlation_matrix.py`
 **Goal:** 30d log-return Pearson correlation matrix for any list of symbols. Output: heatmap CSV + flag pairs > 0.70.
