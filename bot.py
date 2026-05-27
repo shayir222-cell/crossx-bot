@@ -1684,7 +1684,10 @@ async def webhook(request: Request):
 
     reset_daily()
 
-    symbol = data.get('symbol', 'BTCUSDT').upper().replace('/', '').replace('-', '')
+    # TradingView's {{ticker}} for Bitget perps includes the ".P" suffix
+    # (e.g. "TONUSDT.P"). Strip it so the alertcondition() default message
+    # from Pine works without manual override per pair.
+    symbol = data.get('symbol', 'BTCUSDT').upper().replace('/', '').replace('-', '').removesuffix('.P')
     if symbol not in SYMBOLS:
         # Observability: count + log unknown-symbol rejections (Phase C diag)
         try:
