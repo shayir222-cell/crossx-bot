@@ -120,6 +120,20 @@ BE_FEE_BUFFER_PCT = 0.0
 # ─── Score ───────────────────────────────────────────────
 MIN_SCORE = 92  # повышенный порог качества сигналов
 
+# ─── Timeframe ladder ────────────────────────────────────
+# 2026-06-05: entry TF 5m→15m to cut fees ~3x (fewer signals/bar). Live Pine
+# sends no MTF fields, so the bot computes the whole ladder server-side — these
+# constants fully define it. Ladder shifted up one rung. TF_MACRO='1D' degrades
+# to 'neutral' (non-blocking) if the granularity is unsupported. To revert to
+# the 5m regime: ENTRY_TF/TF_CURRENT='5m', STRUCTURE='15m', MOMENTUM='1H',
+# MACRO='4H', DEDUPE_BUCKET_SEC=300. Also move the TradingView chart back to 5m.
+ENTRY_TF          = '15m'    # primary entry + ATR/SL sizing TF (was 5m)
+TF_CURRENT        = '15m'    # current_tf score bucket (was 5m)
+TF_STRUCTURE      = '1H'     # structure score bucket + MTF gate (was 15m)
+TF_MOMENTUM       = '4H'     # momentum score bucket + MTF gate (was 1H)
+TF_MACRO          = '1Dutc'  # macro_trend score bucket + MTF gate (was 4H); '1Dutc' = UTC daily, confirmed supported by Bitget
+DEDUPE_BUCKET_SEC = 900    # dedupe window = one 15m candle (was 300)
+
 # ─── Sessions (UTC hours) ────────────────────────────────
 LONDON_OPEN  = 7
 LONDON_CLOSE = 16
@@ -135,7 +149,7 @@ SL_COOLDOWN = 15  # minutes cooldown after any SL hit
 CORR_GROUPS = []   # TON/ZEC/HYPE pairwise 30d log-return corr <0.31 (well below 0.70 veto) → no group needed
 
 # ─── Time stop ───────────────────────────────────────────
-TIME_STOP_MIN  = 90   # 30→90: give trades time to develop
+TIME_STOP_MIN  = 240  # 2026-06-05: 90→240 — at 15m TF, 240min ≈16 bars (was 18 bars on 5m)
 TIME_STOP_MOVE = 0.003
 
 # ─── Cooldowns & Trade Limits (incremental safety patch) ──
@@ -143,7 +157,7 @@ GLOBAL_COOLDOWN_MIN = 10   # min between any closed trade and next entry
 PAIR_COOLDOWN_MIN   = 15   # min between trades on the same symbol (any outcome)
 MAX_TRADES_HOUR     = 2    # 2026-06-05: 5→2, cut trade frequency → fewer fee events
 MAX_TRADES_SESSION  = 4    # 2026-06-05: 10→4, concentrate into fewer/bigger trades
-DEDUPE_TTL_SEC      = 320  # webhook dedupe hash TTL (>5m bucket so retries inside same candle are deduped)
+DEDUPE_TTL_SEC      = 960  # webhook dedupe hash TTL (>15m bucket so retries inside same candle are deduped)
 LOSS_STREAK_PAUSE_H = 1    # global pause hours after 3rd loss
 
 
@@ -805,17 +819,17 @@ def score_signal(symbol, side, candles_5m, alert_data=None):
 
     is_long = (side == 'long')
 
-    mt = crossx('macro_trend') or get_tf_bias(symbol, '4H')
+    mt = crossx('macro_trend') or get_tf_bias(symbol, TF_MACRO)
     p = points(mt, 25, 12, is_long)
     score += p
     breakdown['macro_trend'] = f'{mt} ({p}/25)'
 
-    mom = crossx('momentum') or get_tf_bias(symbol, '1H')
+    mom = crossx('momentum') or get_tf_bias(symbol, TF_MOMENTUM)
     p = points(mom, 20, 10, is_long)
     score += p
     breakdown['momentum'] = f'{mom} ({p}/20)'
 
-    struct = crossx('structure') or get_tf_bias(symbol, '15m')
+    struct = crossx('structure') or get_tf_bias(symbol, TF_STRUCTURE)
     p = points(struct, 20, 10, is_long)
     score += p
     breakdown['structure'] = f'{struct} ({p}/20)'
@@ -830,7 +844,7 @@ def score_signal(symbol, side, candles_5m, alert_data=None):
     score += p
     breakdown['volume'] = f'{vol_val} ({p}/15)'
 
-    ctf = crossx('current_tf') or get_tf_bias(symbol, '5m')
+    ctf = crossx('current_tf') or get_tf_bias(symbol, TF_CURRENT)
     p = points(ctf, 10, 5, is_long)
     score += p
     breakdown['current_tf'] = f'{ctf} ({p}/10)'
@@ -867,19 +881,20 @@ def score_signal(symbol, side, candles_5m, alert_data=None):
 # MULTI-TIMEFRAME GATE
 # ════════════════════════════════════════════════════════════
 def check_mtf(symbol, side):
-    b4h  = get_tf_bias(symbol, '4H')
-    b1h  = get_tf_bias(symbol, '1H')
-    b15m = get_tf_bias(symbol, '15m')
-    info = f'4h:{b4h} 1h:{b1h} 15m:{b15m}'
+    # MTF gate uses the three rungs above ENTRY_TF (macro/momentum/structure).
+    b_macro  = get_tf_bias(symbol, TF_MACRO)
+    b_mom    = get_tf_bias(symbol, TF_MOMENTUM)
+    b_struct = get_tf_bias(symbol, TF_STRUCTURE)
+    info = f'{TF_MACRO}:{b_macro} {TF_MOMENTUM}:{b_mom} {TF_STRUCTURE}:{b_struct}'
 
     if side == 'long':
-        if b4h == 'bearish':  return False, f'BLOCKED: 4h bearish ({info})'
-        if b1h == 'bearish':  return False, f'BLOCKED: 1h bearish ({info})'
-        if b15m == 'bearish': return False, f'BLOCKED: 15m bearish ({info})'
+        if b_macro  == 'bearish': return False, f'BLOCKED: {TF_MACRO} bearish ({info})'
+        if b_mom    == 'bearish': return False, f'BLOCKED: {TF_MOMENTUM} bearish ({info})'
+        if b_struct == 'bearish': return False, f'BLOCKED: {TF_STRUCTURE} bearish ({info})'
     else:
-        if b4h == 'bullish':  return False, f'BLOCKED: 4h bullish ({info})'
-        if b1h == 'bullish':  return False, f'BLOCKED: 1h bullish ({info})'
-        if b15m == 'bullish': return False, f'BLOCKED: 15m bullish ({info})'
+        if b_macro  == 'bullish': return False, f'BLOCKED: {TF_MACRO} bullish ({info})'
+        if b_mom    == 'bullish': return False, f'BLOCKED: {TF_MOMENTUM} bullish ({info})'
+        if b_struct == 'bullish': return False, f'BLOCKED: {TF_STRUCTURE} bullish ({info})'
 
     return True, info
 
@@ -1064,16 +1079,17 @@ def check_trade_limits():
     return True, ''
 
 def candle_open_5m_ts():
+    """Open epoch of the current ENTRY_TF candle bucket (name kept for compat)."""
     ts = int(time.time())
-    return ts - (ts % 300)
+    return ts - (ts % DEDUPE_BUCKET_SEC)
 
 def is_duplicate_signal(symbol, side):
-    """Hash-based webhook dedupe: symbol + side + 5m candle bucket. TTL ~100s."""
+    """Hash-based webhook dedupe: symbol + side + ENTRY_TF candle bucket."""
     now_epoch = time.time()
     expired = [k for k, exp in _signal_dedupe.items() if exp < now_epoch]
     for k in expired:
         _signal_dedupe.pop(k, None)
-    key = f'{symbol}|{side}|5m|{candle_open_5m_ts()}'
+    key = f'{symbol}|{side}|{ENTRY_TF}|{candle_open_5m_ts()}'
     h = hashlib.md5(key.encode()).hexdigest()
     if h in _signal_dedupe:
         return True
@@ -1825,10 +1841,11 @@ async def webhook(request: Request):
         log_signal(symbol, action, 0, {}, 'halted', 'Daily loss limit hit', session_name)
         return JSONResponse({'status': 'halted'})
 
-    # Candles + ATR
+    # Candles + ATR — fetched on ENTRY_TF so SL = ATR×mult reflects entry-TF
+    # volatility (var name kept as candles_5m for minimal churn; holds ENTRY_TF bars).
     _stages.append(('gates', t_parse_done, time.time()))
     _t_score_start = time.time()
-    candles_5m = get_candles(symbol, '5m', 60)
+    candles_5m = get_candles(symbol, ENTRY_TF, 60)
     if not candles_5m:
         return JSONResponse({'error': 'candle error'}, status_code=500)
 
@@ -2116,7 +2133,7 @@ async def status():
         'active_positions': active_positions,
         'symbols_state': sym_info,
         'settings': {
-            'timeframe': '5m', 'leverage': f'{LEVERAGE}x',
+            'timeframe': ENTRY_TF, 'leverage': f'{LEVERAGE}x',
             'base_risk': f'{BASE_RISK_PCT*100:.2f}%',
             'high_vol_risk': f'{HIGH_VOL_RISK*100:.2f}%',
             'streak_risk': f'{STREAK_RISK*100:.2f}%',
