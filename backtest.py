@@ -40,6 +40,7 @@ Detailed trade log written to backtest_<timestamp>.csv.
 """
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -94,16 +95,26 @@ def fetch_candles_range(symbol: str, granularity: str, days: int):
     out = []
     end_ts_ms = int(time.time() * 1000)
     batch_limit = 200  # Bitget history-candles max
+    empty_streak = 0   # consecutive failed batches at the same offset
     while len(out) < needed:
         batch = fetch_candles_batch(symbol, granularity, end_ts_ms, limit=batch_limit)
         if not batch:
-            break
+            # Don't abandon the whole range on a transient timeout — retry the
+            # same offset a few times with backoff before giving up.
+            empty_streak += 1
+            if empty_streak >= 4:
+                print(f'  [PARTIAL] {symbol} {granularity}: stopped after '
+                      f'{empty_streak} empty batches, have {len(out)} candles', file=sys.stderr)
+                break
+            time.sleep(2.0 * empty_streak)
+            continue
+        empty_streak = 0
         out = batch + out
         oldest = int(batch[0][0])
         if oldest >= end_ts_ms:
             break
         end_ts_ms = oldest - 1
-        time.sleep(0.2)
+        time.sleep(0.3)
     # Deduplicate by ts and sort ascending
     seen = set()
     cleaned = []
@@ -366,27 +377,74 @@ def score_signal(side, candles_5m, candles_15m, candles_1h, candles_4h):
     return score, breakdown
 
 
+def calc_stdev(values):
+    """Population stdev of a list (returns 0.0 for <2 values)."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    return var ** 0.5
+
+
+def calc_var_ratio(candles, short_w=10, long_w=40):
+    """Variance ratio of log returns: stdev(short) / stdev(long).
+    >1.0 → recent vol elevated (trend persistence); ~1.0 random walk;
+    <1.0 mean-reverting. Mirrors Pine v7 `var_ratio`. Returns 1.0 if
+    insufficient data so the gate is a no-op rather than a false block."""
+    closes = [float(c[4]) for c in candles]
+    if len(closes) < long_w + 1:
+        return 1.0
+    rets = []
+    for i in range(1, len(closes)):
+        prev = closes[i - 1] if closes[i - 1] != 0 else closes[i]
+        rets.append(math.log(closes[i] / prev) if prev > 0 else 0.0)
+    short_std = calc_stdev(rets[-short_w:])
+    long_std = calc_stdev(rets[-long_w:])
+    if long_std <= 0:
+        return 1.0
+    return short_std / long_std
+
+
 # ── Trade simulator ───────────────────────────────────────────────────
-def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_bars=60):
+def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_bars=60,
+                   be_at_r=0.0, be_buffer_pct=0.0, sl_dist=0.0):
     """Simulate fill outcome over future candles.
     Returns (outcome, exit_price, bars_held):
-      outcome: 'tp' | 'sl' | 'time' | 'noop'
+      outcome: 'tp' | 'sl' | 'be' | 'time' | 'noop'
+
+    Break-even option (mirrors live bot + Pine v7 BE-with-fee-buffer):
+      If be_at_r > 0, once price moves be_at_r * sl_dist in favour, the stop
+      is ratcheted to entry ± (be_buffer_pct% of entry). buffer>0 leaves room
+      for round-trip fees so a BE exit nets ~0 instead of -fees. A subsequent
+      adverse touch of that stop exits as 'be' (distinct from the original 'sl').
     """
     if not future_candles:
         return ('noop', entry_price, 0)
+    be_armed = False
+    cur_sl = sl_price
+    use_be = be_at_r > 0.0 and sl_dist > 0.0
     for idx, c in enumerate(future_candles[:max_bars]):
         h, l = float(c[2]), float(c[3])
         if side == 'long':
             # Hit either SL or TP this bar — pessimistic: SL first
-            if l <= sl_price:
-                return ('sl', sl_price, idx + 1)
+            if l <= cur_sl:
+                return ('be' if be_armed else 'sl', cur_sl, idx + 1)
             if h >= tp_price:
                 return ('tp', tp_price, idx + 1)
+            # Arm BE after the TP/SL check (can't move stop on the entry bar's
+            # own spike below; ratchet applies from next evaluation onward)
+            if use_be and not be_armed and h >= entry_price + be_at_r * sl_dist:
+                be_armed = True
+                cur_sl = entry_price * (1.0 + be_buffer_pct / 100.0)
         else:  # short
-            if h >= sl_price:
-                return ('sl', sl_price, idx + 1)
+            if h >= cur_sl:
+                return ('be' if be_armed else 'sl', cur_sl, idx + 1)
             if l <= tp_price:
                 return ('tp', tp_price, idx + 1)
+            if use_be and not be_armed and l <= entry_price - be_at_r * sl_dist:
+                be_armed = True
+                cur_sl = entry_price * (1.0 - be_buffer_pct / 100.0)
     # Time stop at last bar
     last_close = float(future_candles[min(max_bars, len(future_candles)) - 1][4])
     return ('time', last_close, min(max_bars, len(future_candles)))
@@ -394,17 +452,27 @@ def simulate_trade(side, entry_price, sl_price, tp_price, future_candles, max_ba
 
 # ── Main backtest loop ────────────────────────────────────────────────
 def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverage,
-                    adx_min=0.0, strategy='v2', block_hours=None, min_atr_pct=0.0):
+                    adx_min=0.0, strategy='v2', block_hours=None, min_atr_pct=0.0,
+                    climax_mult=0.0, var_ratio_min=0.0, wick_reject=False,
+                    fake_break=False, be_at_r=0.0, be_buffer_pct=0.0, prefetched=None):
     print(f'\n=== {symbol} ===')
-    print(f'  Fetching 5m candles ({days}d)...')
-    c5  = fetch_candles_range(symbol, '5m',  days)
-    if not c5 or len(c5) < 100:
-        print(f'  [SKIP] not enough 5m data ({len(c5) if c5 else 0} candles)')
-        return None
-    print(f'  Fetching 15m / 1H / 4H...')
-    c15 = fetch_candles_range(symbol, '15m', days)
-    c1h = fetch_candles_range(symbol, '1H',  days)
-    c4h = fetch_candles_range(symbol, '4H',  days)
+    if prefetched is not None:
+        # Reuse candles fetched once by a caller (e.g. multi-config runner) to
+        # avoid re-downloading the same history for every parameter variant.
+        c5, c15, c1h, c4h = prefetched
+        if not c5 or len(c5) < 100:
+            print(f'  [SKIP] not enough 5m data ({len(c5) if c5 else 0} candles)')
+            return None
+    else:
+        print(f'  Fetching 5m candles ({days}d)...')
+        c5  = fetch_candles_range(symbol, '5m',  days)
+        if not c5 or len(c5) < 100:
+            print(f'  [SKIP] not enough 5m data ({len(c5) if c5 else 0} candles)')
+            return None
+        print(f'  Fetching 15m / 1H / 4H...')
+        c15 = fetch_candles_range(symbol, '15m', days)
+        c1h = fetch_candles_range(symbol, '1H',  days)
+        c4h = fetch_candles_range(symbol, '4H',  days)
 
     # Build timestamp→index maps for 15m/1h/4h (lookup higher-TF context per 5m bar)
     def map_by_ts(candles):
@@ -467,6 +535,26 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
             if adx_val < adx_min:
                 continue
 
+        # Climax-bar filter (Pine v7 `no_climax`): skip FOMO entries on bars
+        # whose range exceeds climax_mult * ATR — SL would sit at a poor level.
+        if climax_mult > 0.0:
+            bar_range = float(bar[2]) - float(bar[3])
+            if bar_range > atr * climax_mult:
+                continue
+
+        # Variance-ratio regime gate (Pine v7 `trending_regime`): only trade
+        # when recent vol is elevated vs baseline (trend persistence).
+        if var_ratio_min > 0.0:
+            if calc_var_ratio(win5) < var_ratio_min:
+                continue
+
+        # Pre-compute rolling extremes of the prior 5 bars for fake-break test
+        prev5 = c5[max(0, i - 5):i]  # bars before decision bar
+        prev5_high = max((float(c[2]) for c in prev5), default=float(bar[2]))
+        prev5_low = min((float(c[3]) for c in prev5), default=float(bar[3]))
+        bar_high, bar_low = float(bar[2]), float(bar[3])
+        bar_open, bar_close = float(bar[1]), float(bar[4])
+
         sides_to_test = ('long',) if (_LONGS_ONLY) else ('long', 'short')
         for side in sides_to_test:
             if strategy == 'v3':
@@ -475,6 +563,24 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
                 score, br = score_signal(side, win5, win15, win1h, win4h)
             if score < min_score:
                 continue
+
+            # Wick-rejection entry guard (Pine v7): require close in the
+            # favourable half of the bar AND body colour confirming direction.
+            if wick_reject:
+                upper_half = (bar_close - bar_low) > (bar_high - bar_close)
+                lower_half = (bar_high - bar_close) > (bar_close - bar_low)
+                if side == 'long' and not (upper_half and bar_close > bar_open):
+                    continue
+                if side == 'short' and not (lower_half and bar_close < bar_open):
+                    continue
+
+            # Fake-break filter (Pine v7): skip entries where the bar pierced
+            # the prior-5 extreme but closed back against the break direction.
+            if fake_break:
+                if side == 'long' and bar_high > prev5_high and bar_close < bar_open:
+                    continue
+                if side == 'short' and bar_low < prev5_low and bar_close > bar_open:
+                    continue
 
             # Entry next bar open
             if i + 1 >= len(c5):
@@ -489,7 +595,9 @@ def backtest_symbol(symbol, days, min_score, sl_atr_mult, tp_r, fee_pct, leverag
                 tp_price = entry - sl_dist * tp_r
 
             future = c5[i+1:i+61]
-            outcome, exit_price, bars = simulate_trade(side, entry, sl_price, tp_price, future)
+            outcome, exit_price, bars = simulate_trade(
+                side, entry, sl_price, tp_price, future,
+                be_at_r=be_at_r, be_buffer_pct=be_buffer_pct, sl_dist=sl_dist)
             if outcome == 'noop':
                 continue
 
@@ -571,6 +679,19 @@ def main():
                    help='comma-separated UTC hours 0-23 to skip entries on (e.g. "2,3,4,5,6,7,8")')
     p.add_argument('--min_atr_pct', type=float, default=0.0,
                    help='skip entries where atr/close*100 < this percent (0 = no filter)')
+    # ── v7-derived candidate filters (default off = no behaviour change) ──
+    p.add_argument('--climax_mult', type=float, default=0.0,
+                   help='skip entries whose decision-bar range > this * ATR (0 = off)')
+    p.add_argument('--var_ratio_min', type=float, default=0.0,
+                   help='require stdev(10)/stdev(40) of log-returns >= this (0 = off; v7 uses 1.10)')
+    p.add_argument('--wick_reject', action='store_true',
+                   help='require close in favourable half of bar + confirming body colour')
+    p.add_argument('--fake_break', action='store_true',
+                   help='skip bars that pierced prior-5 extreme but closed against the break')
+    p.add_argument('--be_at_r', type=float, default=0.0,
+                   help='ratchet stop to break-even once price reaches this R (0 = off)')
+    p.add_argument('--be_buffer_pct', type=float, default=0.0,
+                   help='offset BE stop by this %% of entry to cover round-trip fees (v7: 0.05)')
     args = p.parse_args()
 
     # Parse + validate --block_hours; drop out-of-range values with a warning
@@ -605,12 +726,21 @@ def main():
     print(f'  strategy={args.strategy}  adx_min={args.adx_min}  longs_only={args.longs_only}  '
           f'block_hours={sorted(block_hours) if block_hours else "(none)"}  '
           f'min_atr_pct={args.min_atr_pct}')
+    print(f'  [v7-filters] climax_mult={args.climax_mult}  var_ratio_min={args.var_ratio_min}  '
+          f'wick_reject={args.wick_reject}  fake_break={args.fake_break}  '
+          f'be_at_r={args.be_at_r}  be_buffer_pct={args.be_buffer_pct}')
     for sym in symbols:
         trades = backtest_symbol(sym, args.days, args.min_score, args.sl_atr, args.tp_r,
                                   args.fee_pct, args.leverage, adx_min=args.adx_min,
                                   strategy=args.strategy,
                                   block_hours=block_hours,
-                                  min_atr_pct=args.min_atr_pct) or []
+                                  min_atr_pct=args.min_atr_pct,
+                                  climax_mult=args.climax_mult,
+                                  var_ratio_min=args.var_ratio_min,
+                                  wick_reject=args.wick_reject,
+                                  fake_break=args.fake_break,
+                                  be_at_r=args.be_at_r,
+                                  be_buffer_pct=args.be_buffer_pct) or []
         summary = report(sym, trades, args.capital, args.risk_pct)
         if summary:
             all_summary.append(summary)

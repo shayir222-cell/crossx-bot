@@ -59,7 +59,7 @@ ADX_MIN_THRESHOLD      = float(os.environ.get('ADX_MIN_THRESHOLD', '20.0'))     
 
 BASE_URL = 'https://api.bitget.com'
 
-SYMBOLS = ['TONUSDT', 'ZECUSDT', 'HYPEUSDT']
+SYMBOLS = ['TONUSDT', 'ZECUSDT']  # 2026-06-05: drop HYPE — live bleeder (PF 0.21, -0.94%/trade, 💀 every window)
 
 # Per-pair calibration:
 # 2026-05-27: drop BNB (negative live PF 0.40, negative backtest EV -0.228R,
@@ -71,13 +71,11 @@ SYMBOLS = ['TONUSDT', 'ZECUSDT', 'HYPEUSDT']
 PAIR_TP_R = {
     'TONUSDT':  2.0,
     'ZECUSDT':  2.0,
-    'HYPEUSDT': 2.0,
 }
 
 PAIR_MIN_SCORE = {
     'TONUSDT':  92,
     'ZECUSDT':  92,
-    'HYPEUSDT': 92,
 }
 
 # Full per-symbol thresholds kept for fast re-enablement post-improvements.
@@ -94,10 +92,14 @@ MIN_ATR_PCT = {
 }
 
 # ─── Risk ────────────────────────────────────────────────
-BASE_RISK_PCT    = 0.0050  # сниженный риск на базовых сделках
-HIGH_VOL_RISK    = 0.0030  # более осторожный риск в высокую волатильность
-STREAK_RISK      = 0.0075  # уменьшенный риск на сильных сигналах
-LEVERAGE         = 7     # 10→7: reduces notional 30% → fees 30% lower
+# 2026-06-05: 2x margin-per-trade bump (user: "увеличь маржу на каждую сделку").
+# Concentrate into fewer, bigger positions. STREAK_RISK is the dominant path
+# since MIN_SCORE=92 → almost every taken trade scores >=90. Hard backstops
+# remain: 20% margin cap (entry sizing), daily loss limit 10%, loss-streak halving.
+BASE_RISK_PCT    = 0.0100  # 0.005→0.010 (score 82-89 tier)
+HIGH_VOL_RISK    = 0.0060  # 0.003→0.006 (high-vol tier)
+STREAK_RISK      = 0.0150  # 0.0075→0.015 (score>=90 — the normal path)
+LEVERAGE         = 7     # kept at 7: lowering it would shrink the 20% max-size cap and fight the bigger-margin goal; raising to 10 is the rejected pure-aggro path
 DAILY_LOSS_LIMIT = 0.10
 
 # ─── ATR levels ──────────────────────────────────────────
@@ -108,6 +110,12 @@ TRAIL_ATR_MULT = 1.0   # 1.5→1.0: tighter trail after TP1 captures more peak
 MAX_GIVEBACK   = 0.25  # 0.30→0.25: give back even less at peak
 TP1_SIZE_PCT   = 0.50  # 0.40→0.50: lock in half at first TP
 TP2_SIZE_PCT   = 0.50  # 0.30→0.50: close full remainder at TP2
+# Break-even fee buffer (Pine v7 idea): offset the BE stop by this fraction of
+# entry so a runner stopped at BE nets ~0 instead of -round_trip_fees. DEFAULT
+# 0.0 = exact-entry BE = current behaviour (no change during Phase 0 soak).
+# Activate (~0.0008 = 0.08%) only after the live snapshot decision. Validated
+# in backtest.py via --be_buffer_pct before flipping here.
+BE_FEE_BUFFER_PCT = 0.0
 
 # ─── Score ───────────────────────────────────────────────
 MIN_SCORE = 92  # повышенный порог качества сигналов
@@ -133,8 +141,8 @@ TIME_STOP_MOVE = 0.003
 # ─── Cooldowns & Trade Limits (incremental safety patch) ──
 GLOBAL_COOLDOWN_MIN = 10   # min between any closed trade and next entry
 PAIR_COOLDOWN_MIN   = 15   # min between trades on the same symbol (any outcome)
-MAX_TRADES_HOUR     = 5    # statistics-collection mode (was 2)
-MAX_TRADES_SESSION  = 10   # statistics-collection mode (was 5) — per-session cap
+MAX_TRADES_HOUR     = 2    # 2026-06-05: 5→2, cut trade frequency → fewer fee events
+MAX_TRADES_SESSION  = 4    # 2026-06-05: 10→4, concentrate into fewer/bigger trades
 DEDUPE_TTL_SEC      = 320  # webhook dedupe hash TTL (>5m bucket so retries inside same candle are deduped)
 LOSS_STREAK_PAUSE_H = 1    # global pause hours after 3rd loss
 
@@ -1457,7 +1465,8 @@ def monitor():
 
                 # Break-Even SL at +1.0R (before TP1) — prevents reversals turning winners into losers
                 if not pos['be_set'] and float_r >= 1.0:
-                    pos['sl'] = entry
+                    be_off = BE_FEE_BUFFER_PCT * (1 if side == 'long' else -1)
+                    pos['sl'] = entry * (1.0 + be_off)
                     pos['be_set'] = True
                     logger.log_event('be_set', symbol=symbol, side=side, entry=entry,
                                      float_r=round(float_r, 2))
@@ -1471,7 +1480,7 @@ def monitor():
                         place_order(symbol, close_side, tp1_size, reduce_only=True)
                         pos['remaining'] -= tp1_size
                         pos['tp1_hit'] = True
-                        pos['sl'] = entry
+                        pos['sl'] = entry * (1.0 + BE_FEE_BUFFER_PCT * (1 if side == 'long' else -1))
                         metrics.inc('tp_hits_total')
                         logger.log_event('tp_hit', target='TP1', symbol=symbol, side=side,
                                          price=price, size_closed=tp1_size,
